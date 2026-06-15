@@ -1,0 +1,44 @@
+[project]
+name = "sarm-hand"
+version = "0.1.0"
+description = "S-ARM101 robotic arm control, Quest 2 teleoperation, and LeRobot data collection"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "S-ARM101 Team" }]
+keywords = ["robotics", "lerobot", "so-arm101", "teleoperation", "phospho"]
+dependencies = [
+    "lerobot[core_scripts,feetech]>=0.5.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+quest = ["phosphobot>=0.3.0"]
+training = ["lerobot[training]>=0.5.0"]
+dev = ["ruff>=0.9.0", "pytest>=8.0"]
+all = ["phosphobot>=0.3.0", "lerobot[training]>=0.5.0"]
+
+[project.scripts]
+sarm-hand = "sarm_hand.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sarm_hand"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sarm_hand", "config", "README.md"]
+
+[dependency-groups]
+dev = ["ruff>=0.9.0", "pytest>=8.0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

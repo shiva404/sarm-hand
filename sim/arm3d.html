@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sarm-hand · 3D joint simulator</title>
+<link rel="stylesheet" href="css/arm3d.css?v=1" />
+<link rel="stylesheet" href="css/labels.css?v=1" />
+</head>
+<body>
+<div id="loading">Loading config…</div>
+<div id="app"></div>
+
+<div class="brand">
+  <h1>sarm-hand</h1>
+  <p>3D joint simulator</p>
+</div>
+<div class="source" id="source">reading config…</div>
+
+<div class="toolbar">
+  <div class="toolbar-row"><button id="resetView" title="Reset camera">&#x2316;</button><span class="toolbar-lbl">Reset</span></div>
+  <div class="toolbar-row"><button id="toggleGrid" title="Toggle grid">&#9783;</button><span class="toolbar-lbl">Grid</span></div>
+  <div class="toolbar-row"><button id="reloadCfg" title="Reload config">&#x21bb;</button><span class="toolbar-lbl">Reload</span></div>
+  <div class="toolbar-row"><button id="toggleAngles" class="active" title="Kinematic angle arcs">&#x2220;</button><span class="toolbar-lbl">Angles</span></div>
+  <div class="toolbar-row"><button id="toggleLengths" class="active" title="Arm link length labels">&#x2194;</button><span class="toolbar-lbl">Lengths</span></div>
+  <div class="toolbar-row"><button id="toggleFreeSwing" title="Free swing −180…180 (off = config min/max)">&#x21c4;</button><span class="toolbar-lbl">Free</span></div>
+  <div class="toolbar-row"><button id="toggleCalLab" title="Angle mapping lab">&#x2699;</button><span class="toolbar-lbl">Cal</span></div>
+  <div class="toolbar-row"><button id="toggleReach" class="reach-on" title="Reachability envelope">&#x25CE;</button><span class="toolbar-lbl">Reach</span></div>
+</div>
+
+<div class="cal-panel" id="calPanel">
+  <h2>Angle mapping lab</h2>
+  <p class="intro"><b>joints.min/max</b> = travel limits. <b>geometry.zero</b> = where kinematic 0° sits — this <em>rotates the 3D arm</em>. Tune zero/sign until FK matches your arm.</p>
+  <select id="calJoint"></select>
+  <div class="pipe" id="calPipe"></div>
+  <h2>Adjust (live preview)</h2>
+  <div id="calControls"></div>
+  <div class="cal-actions">
+    <button type="button" id="calResetJoint">Reset joint</button>
+    <button type="button" id="calResetAll">Reset all</button>
+  </div>
+  <div class="yaml-ref" id="calYamlRef"></div>
+</div>
+
+<div class="panel">
+  <h2>Poses</h2>
+  <div class="poses" id="poses"></div>
+  <h2 id="sliderTitle">Joint values</h2>
+  <div id="sliders"></div>
+</div>
+
+<div class="readout">
+  <h2>Gripper tip — forward kinematics</h2>
+  <div class="grid">
+    <div class="cell"><div class="v"><span id="rx">0</span><span class="u"> mm</span></div><div class="l">X forward</div></div>
+    <div class="cell"><div class="v"><span id="ry">0</span><span class="u"> mm</span></div><div class="l">Y left</div></div>
+    <div class="cell"><div class="v"><span id="rz">0</span><span class="u"> mm</span></div><div class="l">Z up</div></div>
+    <div class="cell"><div class="v"><span id="rp">0</span><span class="u">°</span></div><div class="l">pitch</div></div>
+  </div>
+  <div class="dims" id="reachLine">reach from base: <span id="reach">0</span> mm</div>
+  <div class="pitch-viz" id="pitchViz">
+    <div class="pitch-head">
+      <span class="pitch-title">Hand pitch</span>
+      <span class="pitch-live" id="pitchLiveDesc">live: 0° level</span>
+    </div>
+    <svg id="pitchDiagram" class="pitch-diagram" viewBox="0 0 160 72" aria-label="Side view: hand pitch from horizontal">
+      <line class="pitch-ref" x1="8" y1="36" x2="152" y2="36" />
+      <text class="pitch-ref-lbl" x="154" y="39">0°</text>
+      <g class="pitch-preset" data-deg="0" title="0° level — hand points forward">
+        <line class="pitch-ghost" x1="28" y1="36" x2="72" y2="36" />
+        <text x="76" y="33">level</text>
+      </g>
+      <g class="pitch-preset" data-deg="-30" title="-30° — typical reach pose">
+        <line class="pitch-ghost" x1="28" y1="36" x2="66" y2="58" />
+        <text x="70" y="58">−30°</text>
+      </g>
+      <g class="pitch-preset" data-deg="-90" title="-90° — straight down">
+        <line class="pitch-ghost" x1="28" y1="36" x2="28" y2="72" />
+        <text x="32" y="70">−90°</text>
+      </g>
+      <circle class="pitch-pivot" cx="28" cy="36" r="3" />
+      <line id="pitchTarget" class="pitch-target" x1="28" y1="36" x2="28" y2="36" style="display:none" />
+      <line id="pitchNeedle" class="pitch-needle" x1="28" y1="36" x2="72" y2="36" />
+    </svg>
+    <div class="pitch-modes">
+      <label class="pitch-mode"><input type="radio" name="pitchMode" value="auto" checked /><span>Tip + auto pitch</span></label>
+      <label class="pitch-mode"><input type="radio" name="pitchMode" value="manual" /><span>Tip + set pitch</span></label>
+      <label class="pitch-mode"><input type="radio" name="pitchMode" value="wrist" /><span>Wrist only</span></label>
+    </div>
+    <p class="pitch-hint" id="pitchHint">Tip + auto pitch: x y z is gripper tip. Leave pitch blank — Go picks the best angle.</p>
+  </div>
+  <div class="reach-filter" id="reachFilter">
+    <div class="row"><span>Reach Z slice</span><b><span id="reachZVal">0</span> mm</b></div>
+    <input type="range" id="reachZSlider" min="0" max="350" value="0" step="5" />
+    <div class="count" id="reachZCount">—</div>
+  </div>
+  <div class="reach-go">
+    <div class="row"><span>Go to point</span><span id="pitchFieldLabel">pitch ° (optional)</span></div>
+    <div class="reach-go-row">
+      <input type="text" id="reachGoInput" placeholder="x y z  e.g. 150 0 120" spellcheck="false"
+             autocomplete="off" title="Three numbers separated by spaces (mm)" />
+      <input type="number" id="reachGoPitch" value="" step="5" placeholder="auto"
+             title="Hand pitch: 0=level, -90=down. Optional in auto mode; required in manual; disabled in wrist mode." />
+      <button type="button" id="reachGoBtn">Go</button>
+    </div>
+    <div class="status" id="reachGoStatus">enter x y z · click a preset above or leave pitch on auto</div>
+  </div>
+  <div class="note">IK &amp; reach cloud via Python API (same code as CLI). Sliders use local FK for live readout. <b>hover</b> reach cloud for x,y,z · <b>click</b> to copy · <b>Go</b> calls IK.</div>
+</div>
+
+<div class="hint" id="viewHint">drag to orbit · scroll to zoom · right-drag to pan</div>
+<div id="reachTooltip" class="reach-tooltip" aria-hidden="true"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+    "js-yaml": "https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.mjs"
+  }
+}
+</script>
+<script type="module" src="js/main.js?v=1"></script>
+</body>
+</html>

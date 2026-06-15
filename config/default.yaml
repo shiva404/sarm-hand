@@ -1,0 +1,155 @@
+# S-ARM101 (SO-ARM101) default configuration
+# Copy and customize for your setup.
+
+robot:
+  type: so101_follower
+  id: sarm101_follower
+  port: /dev/tty.usbmodem5B141140091  # auto-detect with: sarm-hand find-port
+  use_degrees: false
+  max_relative_target: 10.0
+  disable_torque_on_disconnect: true
+
+teleop:
+  leader:
+    type: so101_leader
+    id: sarm101_leader
+    port: /dev/tty.usbmodem5B140289771
+  quest:
+    # phosphobot server settings for Meta Quest 2 teleoperation
+    host: "0.0.0.0"
+    port: 8020
+    simulation: false
+
+cameras:
+  # Used by record-leader / record-policy. Teleop does not require a camera unless --with-cameras.
+  front:
+    type: opencv
+    index_or_path: 0
+    width: 640
+    height: 480
+    fps: 30
+
+dataset:
+  repo_id: local/sarm101-dataset
+  root: data/datasets
+  fps: 30
+  single_task: "Pick and place the object"
+  num_episodes: 50
+  episode_time_s: 60
+  reset_time_s: 10
+  push_to_hub: false
+
+# Per-joint servo IDs for setup-motors (target id per row).
+# Use initial_id when reprogramming a motor that is not yet at its target ID.
+motors:
+  follower:
+    shoulder_pan: 1
+    shoulder_lift: 2
+    elbow_flex: 3
+    wrist_flex: 4
+    wrist_roll: 5
+    gripper: 6
+    # Example reprogramming one row from factory ID 1:
+    # shoulder_pan:
+    #   id: 1
+    #   initial_id: 1
+  leader:
+    shoulder_pan: 1
+    shoulder_lift: 2
+    elbow_flex: 3
+    wrist_flex: 4
+    wrist_roll: 5
+    gripper: 6
+
+# Test poses for `sarm-hand test-poses` (normalized: body -100..100, gripper 0..100).
+# Tune these for your arm after calibration.
+poses:
+  sequence: [home, ready, park, home]
+  home:
+    shoulder_pan: 0
+    shoulder_lift: 0
+    elbow_flex: 0
+    wrist_flex: 0
+    wrist_roll: 0
+    gripper: 50
+  ready:
+    shoulder_pan: 0
+    shoulder_lift: -40
+    elbow_flex: 40
+    wrist_flex: -40
+    wrist_roll: 0
+    gripper: 50
+  park:
+    shoulder_pan: 0
+    shoulder_lift: 65
+    elbow_flex: -55
+    wrist_flex: 25
+    wrist_roll: 0
+    gripper: 15
+
+# LeLab web UI — https://huggingface.co/docs/lerobot/main/en/lelab
+lelab:
+  port: 8000
+  open_browser: true
+  # Where LeLab scans for local datasets (defaults to dataset.root)
+  hf_lerobot_home: null
+
+# 3D joint simulator — `uv run sarm-hand sim` → http://127.0.0.1:8763/sim/arm3d.html
+sim:
+  host: 127.0.0.1
+  port: 8763
+  open_browser: true
+  brand_title: sarm-hand
+  brand_subtitle: 3D joint simulator
+  value_suffix: ""          # appended to slider readout (empty = LeRobot normalized)
+  reach_z_max: 350
+  reach_z_tolerance: 10
+  reach_go_tol_mm: 15
+  reach_steps:
+    shoulder_pan: 16
+    shoulder_lift: 12
+    elbow_flex: 12
+    wrist_flex: 8
+  visual:
+    base_bottom_w: 85
+    base_bottom_h: 30
+    base_top_w: 55
+    base_top_h: 70
+    motor: 20
+
+# SO-ARM101 link geometry for the planar FK/IK model (mm).
+# Validated against TheRobotStudio SO101 so101_new_calib.urdf + MJCF (2025-06).
+# Source: joint origin translations between consecutive revolute axes.
+#   shoulder_height  — Z of shoulder_lift (pitch) axis above base_link origin
+#   upper_arm        — shoulder_lift → elbow_flex (URDF elbow origin |x| = 112.57)
+#   forearm          — elbow_flex → wrist_flex (URDF wrist origin |x| = 134.90)
+#   wrist_rot_offset — wrist_flex → wrist_roll (63.7)
+#   hand             — wrist_roll → gripper TCP / gripperframe site (119.9)
+#   gripper_motor    — wrist_roll → gripper joint axis (36.2)
+# Max straight reach ≈ upper_arm + forearm + hand ≈ 371 mm (spec ~500 mm includes base reach).
+# Tune geometry.joints zero/sign after calibration so FK matches the real arm.
+geometry:
+  units: mm
+  shoulder_height: 117
+  upper_arm: 113
+  forearm: 135
+  wrist_rot_offset: 64
+  hand: 120
+  gripper_motor: 36
+  gripper_offset: 0
+  elbow: up
+  joints:
+    shoulder_pan:  { zero: 0, sign: 1 }
+    shoulder_lift: { zero: 0, sign: -1 }
+    elbow_flex:    { zero: 0, sign: 1 }
+    wrist_flex:    { zero: 0, sign: -1 }
+    wrist_roll:    { zero: 0, sign: 1 }
+
+# Joint slider limits for the 3D sim (LeRobot normalized units unless robot.use_degrees).
+joints:
+  shoulder_pan:  { min: -100, max: 100 }
+  shoulder_lift: { min: -100, max: 100 }
+  elbow_flex:    { min: -100, max: 100 }
+  wrist_flex:    { min: -100, max: 100 }
+  wrist_roll:    { min: -100, max: 100 }
+  gripper:       { min: 0, max: 100 }
