@@ -1,0 +1,13 @@
+# Minimal scene — desk only (use genesis.scene: minimal in config/default.yaml).
+name: minimal
+task: "Move the arm"
+description: Empty desk workspace with no manipulable props.
+
+objects:
+  desk:
+    shape: box
+    size: [0.6, 0.4, 0.02]
+    pos: [0.35, 0.0, 0.01]
+    fixed: true
+    color: [0.35, 0.35, 0.38]
+    surface: default

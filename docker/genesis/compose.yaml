@@ -1,0 +1,26 @@
+# Linux NVIDIA: batch Genesis sim recording for sarm-hand.
+# Usage: docker compose -f docker/genesis/compose.yaml run --rm genesis-record
+services:
+  genesis-record:
+    build:
+      context: ../..
+      dockerfile: docker/genesis/Dockerfile
+    image: sarm-hand-genesis:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ../../data:/workspace/hand/data
+      - ../../config:/workspace/hand/config:ro
+    working_dir: /workspace/hand
+    command:
+      - record-sim
+      - --headless
+      - --num-episodes
+      - "10"
+      - --task
+      - "Pick and place the object"

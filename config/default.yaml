@@ -3,6 +3,7 @@
 
 robot:
   type: so101_follower
+  backend: hardware          # hardware | genesis | twin
   id: sarm101_follower
   port: /dev/tty.usbmodem5B141140091  # auto-detect with: sarm-hand find-port
   use_degrees: false
@@ -21,26 +22,90 @@ teleop:
     simulation: false
 
 cameras:
-  # Used by record-leader / record-policy. Teleop does not require a camera unless --with-cameras.
+  # Used by record-leader / record-policy. Teleop: add --with-cameras.
   front:
-    type: opencv
-    index_or_path: 0
+    type: http
+    url: http://192.168.0.58:81/stream
+    # Declared for LeRobot robot config; stream native resolution used at connect
     width: 640
     height: 480
-    fps: 30
+    fps: 10
+
+policy:
+  path: lerobot/smolvla_base
+  device: null              # cuda, mps, or cpu (auto-detect if null)
+  episode_time_s: 60
+  control_fps: 10           # policy/record loop rate (5–10 recommended with HTTP cam)
+  camera_map:
+    front: camera1          # map robot camera → SmolVLA camera slot
+  empty_cameras: 2          # pad camera2/camera3 when using one physical camera
+  train_dataset: null       # defaults to dataset.repo_id for train-smolvla
+  train_steps: 20000
+  train_batch_size: 64
+  output_dir: outputs/train/sarm101_smolvla
 
 dataset:
   repo_id: local/sarm101-dataset
   root: data/datasets
-  fps: 30
+  fps: 10
   single_task: "Pick and place the object"
   num_episodes: 50
   episode_time_s: 60
   reset_time_s: 10
   push_to_hub: false
 
+# Genesis World physics sim — `uv sync --extra genesis` then ./scripts/fetch_so101_assets.sh
+genesis:
+  urdf: assets/robots/so101/so101_new_calib.urdf
+  backend: auto              # auto | metal | cuda | cpu (auto → Metal on Apple Silicon)
+  # Rest pose from `sarm-hand test-motors` (Present_Position, torque off). Converted via calibration.
+  home_raw:
+    shoulder_pan: 2375
+    shoulder_lift: 2119
+    elbow_flex: 2031
+    wrist_flex: 2028
+    wrist_roll: 2050
+    gripper: 2414
+  calibration_role: leader     # leader | follower — LeRobot cal file for norm↔URDF mapping
+  # Wide cal joints (0..4095): map norm linearly to new_calib URDF limits; home anchored via
+  # legacy limits + frame_offset so leader norm gain ≈ 1° per unit (not compressed ~50%).
+  joints:
+    shoulder_pan:  { sign: -1 }
+    shoulder_lift: { sign:  1, urdf_min: -3.31613, urdf_max: 0.174533, frame_offset: 1.5708 }
+    elbow_flex:    { sign:  1, urdf_min: -0.174533, urdf_max: 3.14159, frame_offset: -1.5708 }
+    wrist_flex:    { sign:  1 }
+    wrist_roll:    { sign: -1 }
+    gripper:       { sign:  1 }
+  dt: 0.01
+  scene: pick_place_desk
+  headless: false
+  cameras:
+    front:
+      width: 640
+      height: 480
+      pos: [0.35, -0.55, 0.35]
+      lookat: [0.35, 0.0, 0.12]
+      fov: 55
+    top:
+      width: 640
+      height: 480
+      pos: [0.35, 0.0, 1.15]
+      lookat: [0.35, 0.0, 0.05]
+      fov: 50
+    arm:
+      width: 640
+      height: 480
+      attach_link: gripper_link
+      fov: 60
+
+twin:
+  sync_mode: hardware_to_sim   # hardware_to_sim | sim_to_hardware | bidirectional
+  rate_hz: 30
+  duration_s: null             # null = run until Ctrl+C
+
 # Per-joint servo IDs for setup-motors (target id per row).
 # Use initial_id when reprogramming a motor that is not yet at its target ID.
+# Physical servo model (all joints): see `servo:` block below.
 motors:
   follower:
     shoulder_pan: 1
@@ -60,6 +125,19 @@ motors:
     wrist_flex: 4
     wrist_roll: 5
     gripper: 6
+
+# Feetech ST-3215-C001 on every joint (SO-ARM101 / SO-101). Used by browser sim + Genesis.
+# Gear ratio is inside the servo; URDF/MJCF joint angles are at the gearbox output shaft.
+servo:
+  model: ST-3215-C001
+  lerobot_type: sts3215
+  gear_ratio: 345
+  resolution: 4096
+  voltage_nominal_v: 7.4
+  stall_torque_kg_cm: 19.5
+  urdf_mechanical_reduction: 1.0
+  mujoco_class: sts3215
+  mujoco_forcerange_nm: 3.35
 
 # Test poses for `sarm-hand test-poses` (normalized: body -100..100, gripper 0..100).
 # Tune these for your arm after calibration.

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from . import __version__
+from .cameras import describe_camera, list_usb_cameras, preview_camera, test_configured_cameras
 from .config import JOINT_NAMES, ProjectConfig, parse_initial_ids
 from .data import dataset_export_episode, dataset_info, dataset_push, dataset_sample
 from .lelab_ui import (
@@ -15,9 +17,13 @@ from .lelab_ui import (
     open_dataset_viz_hub,
     viz_dataset_local,
 )
+from .policy import run_smolvla, train_smolvla
 from .record import record_leader, record_policy, record_quest
+from .record_sim import record_sim, record_twin
 from .sim_api import launch_sim
+from .twin import run_genesis_spike, run_twin
 from .poses import list_poses, test_poses
+from .joint_signal_log import run_joint_signal_log
 from .robot import calibrate, disable_arm_torque, find_port, resolve_role_port, setup_motors, test_motors
 from .teleop import teleop_leader, teleop_quest, teleop_quest_instructions
 
@@ -31,8 +37,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("find-port", help="Find USB serial port for the arm")
+    sub.add_parser("list-cameras", help="List USB cameras detected by OpenCV")
     sub.add_parser("config-show", help="Show loaded project configuration")
     sub.add_parser("teleop-quest-help", help="Quest 2 teleoperation instructions")
+
+    p = sub.add_parser("camera-preview", help="Preview a USB camera or HTTP/RTSP stream")
+    p.add_argument("--name", default=None, help="Camera name from config/default.yaml")
+    p.add_argument("--index", type=int, default=None, help="USB camera device index (e.g. 0)")
+    p.add_argument("--url", default=None, help="HTTP or RTSP stream URL")
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--height", type=int, default=None)
+    p.add_argument("--fps", type=int, default=None)
+    p.add_argument("--output", default=None, help="Save first frame to this image path")
+    p.add_argument("--seconds", type=float, default=5.0, help="Preview duration (default: 5)")
+    p.add_argument(
+        "--no-window",
+        action="store_true",
+        help="Do not open a GUI window (use with --output for headless capture)",
+    )
+
+    sub.add_parser("camera-test", help="Test all cameras defined in config/default.yaml")
 
     p = sub.add_parser(
         "setup-motors",
@@ -142,8 +166,40 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("record-policy", help="Record policy evaluation rollouts")
     p.add_argument("--follower-port", default=None)
     p.add_argument("--policy-path", required=True)
+    p.add_argument("--task", default=None, help="Language task query for VLA policies")
     p.add_argument("--repo-id", default=None)
     p.add_argument("--num-episodes", type=int, default=10)
+
+    p = sub.add_parser(
+        "run-smolvla",
+        help="Run SmolVLA policy with a natural-language task on the follower arm",
+    )
+    p.add_argument(
+        "--task",
+        default=None,
+        help="Task query, e.g. 'Pick up the cube and place it in the box'",
+    )
+    p.add_argument("--follower-port", default=None)
+    p.add_argument("--policy-path", default=None, help="HF model id or local checkpoint")
+    p.add_argument("--device", default=None, help="cuda, mps, or cpu")
+    p.add_argument("--episode-time", type=float, default=None, help="Seconds per episode")
+    p.add_argument("--interactive", action="store_true", help="Prompt for task queries")
+    p.add_argument(
+        "--record",
+        action="store_true",
+        help="Record eval episodes with lerobot-record instead of live-only run",
+    )
+    p.add_argument("--repo-id", default=None, help="Eval dataset repo id when --record")
+    p.add_argument("--num-episodes", type=int, default=1)
+    p.add_argument("--display-data", action=argparse.BooleanOptionalAction, default=True)
+
+    p = sub.add_parser("train-smolvla", help="Fine-tune SmolVLA on a recorded dataset")
+    p.add_argument("--dataset-repo-id", default=None)
+    p.add_argument("--policy-path", default=None, help="Base model (default: lerobot/smolvla_base)")
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--device", default=None)
 
     p = sub.add_parser("data-info", help="Show dataset metadata")
     p.add_argument("--repo-id", default=None)
@@ -185,17 +241,106 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--no-browser", action="store_true")
 
+    p = sub.add_parser(
+        "genesis-spike",
+        help="Smoke-test Genesis World (load SO-101 URDF, step physics)",
+    )
+    p.add_argument("--headless", action="store_true")
+
+    p = sub.add_parser(
+        "twin",
+        help="Digital twin: mirror USB follower joints in Genesis World",
+    )
+    p.add_argument("--follower-port", default=None)
+    p.add_argument("--rate", type=float, default=None, help="Sync rate Hz (default: twin.rate_hz)")
+    p.add_argument("--duration", type=float, default=None, help="Seconds (default: until Ctrl+C)")
+
+    p = sub.add_parser("record-sim", help="Record LeRobot dataset in Genesis simulation")
+    p.add_argument("--repo-id", default=None)
+    p.add_argument("--num-episodes", type=int, default=None)
+    p.add_argument("--episode-time", type=float, default=None)
+    p.add_argument("--task", default=None)
+    p.add_argument("--headless", action="store_true", help="Hide Genesis viewer (overrides config)")
+    p.add_argument("--gui", action="store_true", help="Show Genesis viewer (overrides config)")
+    p.add_argument("--random-actions", action="store_true", help="Random policy (wiring test)")
+    p.add_argument(
+        "--leader",
+        action="store_true",
+        help="Drive Genesis sim from USB leader arm (uses teleop.leader.port from config)",
+    )
+    p.add_argument("--leader-port", default=None, help="Leader USB port (overrides config)")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append episodes to an existing dataset (requires --repo-id)",
+    )
+    p.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="Use fixed repo id without timestamp (fails if dataset exists)",
+    )
+
+    p = sub.add_parser(
+        "log-joint-signal",
+        help="Log encoder pulses vs LeRobot norm vs Genesis sim angles (90° travel gap)",
+    )
+    p.add_argument("--role", choices=["follower", "leader"], default="leader")
+    p.add_argument("--port", default=None)
+    p.add_argument(
+        "--analyze-only",
+        action="store_true",
+        help="Print expected pulses table only (no USB hardware)",
+    )
+    p.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Skip live hardware logging (same as --analyze-only)",
+    )
+    p.add_argument("--duration", type=float, default=45.0, help="Live log duration (seconds)")
+    p.add_argument("--rate", type=float, default=10.0, help="Live sample rate (Hz)")
+    p.add_argument("--output", default=None, help="JSONL output path for live samples")
+    p.add_argument(
+        "--target-degrees",
+        type=float,
+        default=90.0,
+        help="Sim travel angle for expected-pulse column (default: 90)",
+    )
+
+    p = sub.add_parser(
+        "record-twin",
+        help="Record hardware joints + Genesis-rendered camera to LeRobot dataset",
+    )
+    p.add_argument("--follower-port", default=None)
+    p.add_argument("--repo-id", default=None)
+    p.add_argument("--num-episodes", type=int, default=1)
+    p.add_argument("--episode-time", type=float, default=None)
+    p.add_argument("--task", default=None)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append episodes to an existing dataset (requires --repo-id)",
+    )
+    p.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="Use fixed repo id without timestamp (fails if dataset exists)",
+    )
+
     return parser
 
 
 def _show_config() -> None:
     cfg = ProjectConfig.load()
-    print(f"Robot:   {cfg.robot.type} @ {cfg.robot.port or '(auto)'} id={cfg.robot.id}")
+    print(f"Robot:   {cfg.robot.type} backend={cfg.robot.backend} @ {cfg.robot.port or '(auto)'}")
     print(f"Leader:  {cfg.teleop.leader.type} @ {cfg.teleop.leader.port or '(auto)'}")
     print(f"Quest:   phosphobot on port {cfg.teleop.quest.port}")
     print(f"Dataset: {cfg.dataset.repo_id} → {cfg.resolve_dataset_root()}")
-    print(f"LeLab:   HF_LEROBOT_HOME → {cfg.lelab.resolve_hf_lerobot_home(cfg)}")
+    print(f"Policy:  {cfg.policy.path} (device={cfg.policy.device or 'auto'})")
+    print(f"Genesis: scene={cfg.genesis.scene} backend={cfg.genesis.backend}")
+    print(f"Twin:    {cfg.twin.sync_mode} @ {cfg.twin.rate_hz} Hz")
     print(f"Cameras: {list(cfg.cameras.keys()) or '(none)'}")
+    for name, cam in cfg.cameras.items():
+        print(f"  {describe_camera(name, cam)}")
     for role in ("follower", "leader"):
         motor_map = cfg.motor_map(role)
         ids = ", ".join(f"{j}={motor_map.ids[j]}" for j in JOINT_NAMES)
@@ -208,10 +353,26 @@ def main() -> None:
     match args.command:
         case "find-port":
             find_port()
+        case "list-cameras":
+            list_usb_cameras()
         case "config-show":
             _show_config()
         case "teleop-quest-help":
             teleop_quest_instructions()
+        case "camera-preview":
+            preview_camera(
+                name=args.name,
+                index=args.index,
+                url=args.url,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                output=args.output,
+                seconds=args.seconds,
+                show_window=not args.no_window,
+            )
+        case "camera-test":
+            test_configured_cameras()
         case "setup-motors":
             try:
                 overrides = parse_initial_ids(args.initial_ids)
@@ -263,7 +424,35 @@ def main() -> None:
         case "record-quest":
             record_quest(args.repo_id, args.push_to_hub)
         case "record-policy":
-            record_policy(args.follower_port, args.policy_path, args.repo_id, args.num_episodes)
+            record_policy(
+                args.follower_port,
+                args.policy_path,
+                args.repo_id,
+                args.num_episodes,
+                single_task=args.task,
+            )
+        case "run-smolvla":
+            run_smolvla(
+                args.task,
+                follower_port=args.follower_port,
+                policy_path=args.policy_path,
+                episode_time_s=args.episode_time,
+                display_data=args.display_data,
+                device=args.device,
+                record=args.record,
+                repo_id=args.repo_id,
+                num_episodes=args.num_episodes,
+                interactive=args.interactive,
+            )
+        case "train-smolvla":
+            train_smolvla(
+                args.dataset_repo_id,
+                policy_path=args.policy_path,
+                output_dir=args.output_dir,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                device=args.device,
+            )
         case "data-info":
             dataset_info(args.repo_id, args.root)
         case "data-sample":
@@ -289,6 +478,64 @@ def main() -> None:
                 host=args.host,
                 port=args.port,
                 open_browser=not args.no_browser,
+            )
+        case "genesis-spike":
+            run_genesis_spike(headless=args.headless)
+        case "twin":
+            run_twin(
+                follower_port=args.follower_port,
+                rate_hz=args.rate,
+                duration_s=args.duration,
+            )
+        case "record-sim":
+            if args.gui and args.headless:
+                print("Use only one of --gui or --headless.", file=sys.stderr)
+                raise SystemExit(2)
+            if args.leader and args.random_actions:
+                print("Use only one of --leader or --random-actions.", file=sys.stderr)
+                raise SystemExit(2)
+            sim_headless = None
+            if args.gui:
+                sim_headless = False
+            elif args.headless:
+                sim_headless = True
+            leader_port = args.leader_port
+            if args.leader:
+                from .config import ProjectConfig
+
+                cfg = ProjectConfig.load()
+                leader_port = leader_port or cfg.teleop.leader.port
+            record_sim(
+                repo_id=args.repo_id,
+                num_episodes=args.num_episodes,
+                episode_time_s=args.episode_time,
+                single_task=args.task,
+                headless=sim_headless,
+                random_actions=args.random_actions,
+                leader_port=leader_port,
+                resume=args.resume,
+                timestamp=not args.no_timestamp,
+            )
+        case "log-joint-signal":
+            run_joint_signal_log(
+                role=args.role,
+                port=args.port,
+                analyze_only=args.analyze_only or args.no_live,
+                live=not (args.analyze_only or args.no_live),
+                duration_s=args.duration,
+                rate_hz=args.rate,
+                output=Path(args.output) if args.output else None,
+                target_degrees=args.target_degrees,
+            )
+        case "record-twin":
+            record_twin(
+                follower_port=args.follower_port,
+                repo_id=args.repo_id,
+                num_episodes=args.num_episodes,
+                episode_time_s=args.episode_time,
+                single_task=args.task,
+                resume=args.resume,
+                timestamp=not args.no_timestamp,
             )
         case _:
             print(f"Unknown command: {args.command}", file=sys.stderr)

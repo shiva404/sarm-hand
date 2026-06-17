@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from pathlib import Path
 
 from .config import ProjectConfig
+from .policy import _smolvla_record_flags
 from .robot import ensure_port
 
 
@@ -96,6 +96,7 @@ def record_policy(
     policy_path: str = "",
     repo_id: str | None = None,
     num_episodes: int = 10,
+    single_task: str | None = None,
 ) -> None:
     """Record evaluation rollouts using a trained policy (no teleop device)."""
     if not policy_path:
@@ -105,6 +106,7 @@ def record_policy(
     cfg = ProjectConfig.load()
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
     resolved_repo_id = repo_id or f"{cfg.dataset.repo_id}-eval"
+    resolved_task = single_task or cfg.dataset.single_task
     dataset_root = cfg.resolve_dataset_root()
 
     cmd = [
@@ -116,7 +118,7 @@ def record_policy(
         f"--dataset.root={dataset_root}",
         f"--dataset.fps={cfg.dataset.fps}",
         f"--dataset.num_episodes={num_episodes}",
-        f"--dataset.single_task={cfg.dataset.single_task}",
+        f"--dataset.single_task={resolved_task}",
         f"--policy.path={policy_path}",
         "--display_data=true",
     ]
@@ -124,5 +126,6 @@ def record_policy(
     cameras = cfg.cameras_lerobot_dict()
     if cameras:
         cmd.append(f"--robot.cameras={cameras!r}")
+    cmd.extend(_smolvla_record_flags(cfg))
 
     subprocess.run(cmd, check=True)

@@ -12,6 +12,7 @@ LeRobot-based project for the **S-ARM101** (SO-ARM101) 6-axis robotic arm with U
 | **Data access** | Inspect, sample, export, and push datasets to Hugging Face Hub |
 | **LeLab UI** | Web UI for calibration, 3D teleop, datasets, training via [LeLab](https://huggingface.co/docs/lerobot/main/en/lelab) |
 | **3D simulator** | Config-driven joint sim with FK/IK, reach cloud, and pose presets |
+| **Genesis twin** | Optional physics sim: hardware→Genesis mirror, sim recording, sim-to-real datasets |
 
 ## Requirements
 
@@ -30,6 +31,10 @@ uv sync
 
 # For Meta Quest 2 teleoperation, also install phosphobot:
 uv sync --extra quest
+
+# For Genesis World physics sim (digital twin, sim recording):
+uv sync --extra genesis
+./scripts/fetch_so101_assets.sh
 
 # Find USB port (connect power + USB first)
 uv run sarm-hand find-port
@@ -60,6 +65,65 @@ uv run sarm-hand config-show
 ```
 
 Edit `config/default.yaml` to set default ports, cameras, and dataset settings.
+
+### Cameras (USB or HTTP stream)
+
+Cameras are used during dataset recording (`record-leader`, `record-policy`) and optionally during teleop (`--with-cameras`).
+
+**USB camera** — set device index or path in `config/default.yaml`:
+
+```yaml
+cameras:
+  front:
+    type: opencv
+    index_or_path: 0          # or /dev/video0 on Linux
+    width: 640
+    height: 480
+    fps: 30
+```
+
+**macOS built-in / FaceTime camera** — use native resolution (`auto_resolution: true`). Forced 640×480@30 often opens but fails to capture frames:
+
+```yaml
+cameras:
+  front:
+    type: opencv
+    index_or_path: 0
+    auto_resolution: true
+    width: null
+    height: null
+    fps: null
+    warmup_s: 3
+```
+
+Run `sarm-hand list-cameras` to see the native profile (e.g. 1920×1080 @ 15 fps).
+
+**HTTP/MJPEG or RTSP stream** — use `type: http` (or `rtsp`) with a URL. Leave resolution/fps as `null` to auto-detect from the stream:
+
+```yaml
+cameras:
+  overhead:
+    type: http
+    url: http://192.168.1.100:8080/video
+    width: null
+    height: null
+    fps: null
+```
+
+```bash
+# List USB cameras on this machine
+uv run sarm-hand list-cameras
+
+# Preview USB index 0 or a configured camera
+uv run sarm-hand camera-preview --index 0
+uv run sarm-hand camera-preview --name front
+
+# Preview an HTTP stream (save snapshot headless)
+uv run sarm-hand camera-preview --url http://192.168.1.100:8080/video --no-window --output /tmp/frame.jpg
+
+# Test all cameras in config/default.yaml
+uv run sarm-hand camera-test
+```
 
 ### SO-ARM101 leader settings
 
@@ -247,6 +311,48 @@ Record episodes with the **B** button while `teleop-quest` is running. Then insp
 uv run sarm-hand record-quest --repo-id your-username/sarm101-vr-demos
 ```
 
+### SmolVLA (language → robot actions)
+
+[SmolVLA](https://huggingface.co/docs/lerobot/smolvla) is a vision-language-action model: you give a **text task query**, it watches your camera(s), and drives the follower arm.
+
+**Setup**
+
+```bash
+uv sync --extra smolvla
+```
+
+Configure cameras in `config/default.yaml` (required). For a **single camera** with `lerobot/smolvla_base`, map it to `camera1` and pad the other slots:
+
+```yaml
+policy:
+  camera_map:
+    front: camera1
+  empty_cameras: 2
+```
+
+Optionally set `policy.path` to a fine-tuned checkpoint.
+
+**Workflow**
+
+1. Record demos: `sarm-hand record-leader ...`
+2. Fine-tune: `sarm-hand train-smolvla --dataset-repo-id local/sarm101-dataset`
+3. Run a task:
+
+```bash
+# Single task query
+uv run sarm-hand run-smolvla --task "Pick up the cube and place it in the box"
+
+# Interactive — prompt for each task
+uv run sarm-hand run-smolvla --interactive
+
+# Use a fine-tuned checkpoint
+uv run sarm-hand run-smolvla \
+  --task "Grasp the lego block" \
+  --policy-path outputs/train/sarm101_smolvla
+```
+
+The base model `lerobot/smolvla_base` is pretrained on community data. For reliable SO-101 tasks, fine-tune on your own demonstrations first.
+
 ### Policy evaluation recording
 
 ```bash
@@ -282,20 +388,167 @@ frame = dataset[0]
 print(frame.keys())
 ```
 
+## Genesis World (physics sim)
+
+Optional [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world) integration adds rigid-body physics, contact, and rendered cameras for **sim-to-real** workflows. The lightweight browser sim (`sarm-hand sim`) remains for FK/IK calibration; Genesis is the physics layer.
+
+### Install
+
+```bash
+uv sync --extra genesis
+./scripts/fetch_so101_assets.sh   # SO-101 URDF + meshes from SO-ARM100
+```
+
+Genesis is an optional extra so hardware-only installs stay lean.
+
+### Configuration
+
+`config/default.yaml`:
+
+```yaml
+robot:
+  backend: hardware          # hardware | genesis | twin
+
+genesis:
+  urdf: assets/robots/so101/so101_new_calib.urdf
+  backend: auto              # auto → Metal on Apple Silicon, CUDA on Linux
+  scene: pick_place_desk
+  headless: false            # false → main viewer + front/top/arm camera windows
+  cameras:
+    front: { width: 640, height: 480, pos: [0.35, -0.55, 0.35], lookat: [0.35, 0.0, 0.12] }
+    top:   { width: 640, height: 480, pos: [0.35, 0.0, 1.15], lookat: [0.35, 0.0, 0.05] }
+    arm:   { width: 640, height: 480, attach_link: gripper_link }  # gripper-mounted
+
+twin:
+  sync_mode: hardware_to_sim
+  rate_hz: 30
+```
+
+### Scene objects (colors, shapes, placement)
+
+Genesis props are defined in `config/scenes/<name>.yaml`. Set `genesis.scene` in `config/default.yaml` to choose a scene (`pick_place_desk`, `minimal`, or your own file).
+
+```yaml
+# config/scenes/pick_place_desk.yaml
+objects:
+  desk:
+    shape: box
+    size: [0.5, 0.35, 0.02]
+    pos: [0.35, 0.0, 0.01]
+    fixed: true
+    color: [0.45, 0.32, 0.18]    # RGB 0–1, or hex e.g. "#e63946"
+    surface: rough               # default | plastic | rough | glass | gold | aluminum
+
+  pen:
+    shape: cylinder
+    radius: 0.004
+    height: 0.12
+    pos: [0.28, 0.08, 0.08]
+    color: [0.15, 0.35, 0.85]
+
+  red_cube:
+    shape: box
+    size: [0.03, 0.03, 0.03]
+    pos: [0.30, -0.06, 0.05]
+    color: "#e63946"
+    enabled: false               # set true to spawn; false removes from scene
+```
+
+| Field | Purpose |
+|-------|---------|
+| `shape` | `box`, `cylinder`, or `sphere` |
+| `pos` | World position `[x, y, z]` in meters |
+| `size` / `radius` / `height` | Shape dimensions |
+| `color` | RGB list (0–1) or `#rrggbb` hex |
+| `surface` | Material preset (see above) |
+| `fixed` | `true` = static (desk); `false` = movable (pen) |
+| `enabled` | `false` = omit object from scene |
+| `density` | Optional physics density (kg/m³) |
+
+Use `genesis.scene: minimal` for an empty desk, or copy a scene file and add objects. Override path with `genesis.scene_file: config/scenes/my_scene.yaml`.
+
+### Mac (native Metal) — interactive twin
+
+Best for daily sim-to-real development on Apple Silicon:
+
+```bash
+# Smoke test: load URDF, step physics, render all cameras
+uv run sarm-hand genesis-spike
+# Opens main 3D viewer + separate front / top / arm camera windows (when headless: false)
+
+# Digital twin: USB follower joints mirrored in Genesis at 30 Hz
+uv run sarm-hand twin --follower-port /dev/tty.usbmodem...
+
+# Record sim dataset with USB leader arm driving Genesis (no follower needed)
+uv run sarm-hand record-sim --leader
+# Each run writes a new timestamped dataset, e.g. local/sarm101-dataset-genesis-20260616-231500-123456
+
+# Record sim dataset (viewer + OpenCV camera windows when headless: false)
+uv run sarm-hand record-sim --num-episodes 10
+# Records front, top, and arm as observation.images.* videos in the dataset
+uv run sarm-hand record-sim --headless --num-episodes 10   # no viewer / preview windows
+
+# Append more episodes to a specific dataset from an earlier run
+uv run sarm-hand record-sim --leader --resume --repo-id local/sarm101-dataset-genesis-20260616-231500
+
+# Record hardware joints + Genesis camera (sim2real dataset)
+uv run sarm-hand record-twin --follower-port /dev/tty.usbmodem...
+```
+
+### Linux (Docker + NVIDIA) — batch recording
+
+For overnight dataset generation on a GPU server:
+
+```bash
+# Build image (CUDA 12.8 + genesis-world + sarm-hand)
+docker build -t sarm-hand-genesis -f docker/genesis/Dockerfile .
+
+# Headless batch recording
+docker run --gpus all -v $(pwd)/data:/workspace/hand/data sarm-hand-genesis \
+  record-sim --headless --num-episodes 100
+
+# Or use compose
+docker compose -f docker/genesis/compose.yaml run --rm genesis-record
+```
+
+Do **not** rely on Docker for Mac GPU sim — use native Metal instead.
+
+### Architecture
+
+| Command | Purpose |
+|---------|---------|
+| `genesis-spike` | Verify Genesis + SO-101 URDF loads |
+| `twin` | Hardware → Genesis mirror loop |
+| `record-sim` | Pure sim LeRobot dataset |
+| `record-twin` | Hardware state + sim-rendered images |
+
+Set `robot.backend: genesis` to use the sim robot with existing teleop/policy paths (no USB). The twin backend is CLI-only (`sarm-hand twin` / `record-twin`).
+
 ## Project Structure
 
 ```
 .
-├── config/default.yaml      # Robot, geometry, joints, poses, sim settings
-├── sim/                     # 3D joint simulator (arm3d.html + Three.js)
+├── config/
+│   ├── default.yaml         # Robot, genesis, twin, cameras, dataset
+│   └── scenes/              # Scene metadata (pick_place_desk)
+├── assets/robots/so101/     # SO-101 URDF (fetch via scripts/fetch_so101_assets.sh)
+├── docker/genesis/          # Linux NVIDIA batch sim image
+├── scripts/fetch_so101_assets.sh
+├── sim/                     # 3D kinematic simulator (arm3d.html + Three.js)
 ├── src/sarm_hand/
+│   ├── backends/            # hardware | genesis | twin robot backends
+│   ├── genesis/             # Scene, units, SO101SceneDriver
 │   ├── cli.py               # sarm-hand CLI entry point
 │   ├── config.py            # Configuration loading
-│   ├── robot.py             # USB arm helpers
+│   ├── robot.py             # USB arm helpers + build_robot()
+│   ├── twin.py              # Hardware → Genesis twin loop
+│   ├── record_sim.py        # Genesis + twin dataset recording
+│   ├── cameras.py           # USB + HTTP/RTSP camera integration
+│   ├── policy.py            # SmolVLA inference and training
 │   ├── teleop.py            # Leader + Quest 2 teleoperation
-│   ├── record.py            # Data collection
+│   ├── record.py            # Hardware data collection
 │   └── data.py              # Dataset access utilities
-└── pyproject.toml           # uv / hatchling project
+└── pyproject.toml           # uv / hatchling project ([genesis] extra)
 ```
 
 ## macOS USB Notes

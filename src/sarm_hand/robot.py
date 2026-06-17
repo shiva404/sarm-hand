@@ -29,7 +29,7 @@ def find_usb_ports() -> list[str]:
 
 def find_port() -> None:
     """Run LeRobot port discovery and print local USB candidates."""
-    print("S-ARM101 uses USB serial (Feetech STS3215 bus controller).")
+    print("S-ARM101 uses USB serial (Feetech ST-3215-C001 bus, 1:345 on all joints).")
     print("Connect power + USB, then unplug/replug when prompted.\n")
 
     candidates = find_usb_ports()
@@ -525,21 +525,12 @@ def calibrate(role: str, port: str, robot_id: str | None = None) -> None:
 
 
 def build_robot(port: str, config: ProjectConfig | None = None):
-    """Create a connected LeRobot SO101Follower instance for programmatic use."""
-    from lerobot.robots.so_follower import SO101Follower
-    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+    """Create a connected robot backend for programmatic use."""
+    from .backends import build_robot_backend
 
     cfg = config or ProjectConfig.load()
-    robot_cfg = SOFollowerRobotConfig(
-        id=cfg.robot.id,
-        port=port,
-        use_degrees=cfg.robot.use_degrees,
-        max_relative_target=cfg.robot.max_relative_target,
-        disable_torque_on_disconnect=cfg.robot.disable_torque_on_disconnect,
-    )
-    robot = SO101Follower(robot_cfg)
-    robot.connect()
-    return robot
+    robot = build_robot_backend(port, config=cfg, connect=True)
+    return robot.inner if hasattr(robot, "inner") else robot
 
 
 def resolve_role_port(role: str, port: str | None) -> str:

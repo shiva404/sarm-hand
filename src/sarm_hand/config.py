@@ -11,9 +11,13 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "default.yaml"
 
-# S-ARM101 is the SO-ARM101 6-axis arm (Feetech STS3215, USB serial).
+# S-ARM101 is the SO-ARM101 6-axis arm (Feetech ST-3215-C001, USB serial).
 ROBOT_TYPE = "so101_follower"
 LEADER_TYPE = "so101_leader"
+DEFAULT_SERVO_MODEL = "ST-3215-C001"
+DEFAULT_LEROBOT_SERVO_TYPE = "sts3215"
+DEFAULT_SERVO_GEAR_RATIO = 345
+DEFAULT_SERVO_RESOLUTION = 4096
 JOINT_NAMES = (
     "shoulder_pan",
     "shoulder_lift",
@@ -51,6 +55,21 @@ DEFAULT_POSES: dict[str, dict[str, float]] = {
     },
 }
 DEFAULT_POSE_SEQUENCE = ("home", "ready", "park", "home")
+
+
+@dataclass
+class ServoSettings:
+    """Shared Feetech servo hardware — identical on all six SO-ARM101 joints."""
+
+    model: str = DEFAULT_SERVO_MODEL
+    lerobot_type: str = DEFAULT_LEROBOT_SERVO_TYPE
+    gear_ratio: int = DEFAULT_SERVO_GEAR_RATIO  # 1:345 gearbox; URDF/MJCF angle = output shaft
+    resolution: int = DEFAULT_SERVO_RESOLUTION  # 12-bit counts per output revolution
+    voltage_nominal_v: float = 7.4
+    stall_torque_kg_cm: float = 19.5
+    urdf_mechanical_reduction: float = 1.0  # joint axis is gearbox output, not rotor
+    mujoco_class: str = "sts3215"
+    mujoco_forcerange_nm: float = 3.35
 
 
 @dataclass
@@ -93,9 +112,77 @@ class RobotSettings:
     type: str = ROBOT_TYPE
     id: str = "sarm101_follower"
     port: str | None = None
+    backend: str = "hardware"  # hardware | genesis | twin
     use_degrees: bool = False
     max_relative_target: float = 10.0
     disable_torque_on_disconnect: bool = True
+
+
+@dataclass
+class GenesisCameraSettings:
+    width: int = 640
+    height: int = 480
+    attach_link: str | None = None
+    pos: list[float] | None = None
+    lookat: list[float] | None = None
+    fov: float | None = None
+
+
+def _default_genesis_cameras() -> dict[str, GenesisCameraSettings]:
+    from .genesis.cameras import default_genesis_cameras
+
+    return {
+        name: GenesisCameraSettings(**spec)
+        for name, spec in default_genesis_cameras().items()
+    }
+
+
+def _default_genesis_joints() -> dict[str, "GenesisJointSettings"]:
+    """URDF axis sign vs LeRobot positive direction (not the 2D FK geometry block)."""
+    return {
+        name: GenesisJointSettings(sign=sign)
+        for name, sign in (
+            ("shoulder_pan", -1.0),
+            ("shoulder_lift", -1.0),
+            ("elbow_flex", 1.0),
+            ("wrist_flex", 1.0),
+            ("wrist_roll", -1.0),
+            ("gripper", 1.0),
+        )
+    }
+
+
+@dataclass
+class GenesisJointSettings:
+    sign: float = 1.0
+    urdf_offset: float = 0.0
+    # Legacy so101_old_calib limits — used only to anchor home pose for wide cal (0..4095).
+    urdf_min: float | None = None
+    urdf_max: float | None = None
+    # Radians added after legacy home mapping (old → new_calib URDF frame).
+    frame_offset: float = 0.0
+
+
+@dataclass
+class GenesisSettings:
+    urdf: str = "assets/robots/so101/so101_new_calib.urdf"
+    backend: str = "auto"  # auto | metal | cuda | cpu | amdgpu
+    dt: float = 0.01
+    scene: str = "pick_place_desk"
+    scene_file: str | None = None  # optional path override for config/scenes/*.yaml
+    headless: bool = False
+    # Servo Present_Position at rest (from `sarm-hand test-motors`); converted via calibration.
+    home_raw: dict[str, int] = field(default_factory=dict)
+    calibration_role: str = "leader"  # leader | follower — which cal file for home_raw
+    joints: dict[str, GenesisJointSettings] = field(default_factory=_default_genesis_joints)
+    cameras: dict[str, GenesisCameraSettings] = field(default_factory=_default_genesis_cameras)
+
+
+@dataclass
+class TwinSettings:
+    sync_mode: str = "hardware_to_sim"
+    rate_hz: float = 30.0
+    duration_s: float | None = None  # None = run until Ctrl+C
 
 
 @dataclass
@@ -120,11 +207,31 @@ class TeleopSettings:
 
 @dataclass
 class CameraSettings:
+    """USB camera (opencv/usb) or network stream (http/rtsp).
+
+    USB examples:
+      type: opencv, index_or_path: 0
+      type: opencv, index_or_path: /dev/video0
+
+    HTTP/RTSP examples:
+      type: http, url: http://192.168.1.100:8080/video
+      type: rtsp, url: rtsp://192.168.1.100:554/stream
+
+    For streams, omit width/height/fps (null) to use the source's native resolution.
+    On macOS, set auto_resolution: true — built-in cameras often fail at 640x480@30.
+    """
+
     type: str = "opencv"
     index_or_path: int | str = 0
-    width: int = 640
-    height: int = 480
-    fps: int = 30
+    url: str | None = None
+    auto_resolution: bool = False
+    width: int | None = 640
+    height: int | None = 480
+    fps: int | None = 30
+    warmup_s: int | None = None
+    # HTTP/RTSP: max age for read_latest() (ms). Default scales with fps (~15 frame periods).
+    max_frame_age_ms: int | None = None
+    fourcc: str | None = None
 
 
 @dataclass
@@ -137,6 +244,25 @@ class DatasetSettings:
     episode_time_s: int = 60
     reset_time_s: int = 10
     push_to_hub: bool = False
+
+
+@dataclass
+class PolicySettings:
+    """SmolVLA / LeRobot policy settings."""
+
+    path: str = "lerobot/smolvla_base"
+    device: str | None = None  # cuda, mps, cpu — auto-detect if null
+    episode_time_s: int = 60
+    control_fps: int = 10  # inference/record loop rate; 5–10 for HTTP cameras
+    # Map robot camera names → SmolVLA names (smolvla_base expects camera1/2/3)
+    camera_map: dict[str, str] = field(default_factory=lambda: {"front": "camera1"})
+    empty_cameras: int | None = 2  # pad missing camera2/3 when using one physical camera
+    # smolvla_base stores stats under so100.buffer.* — remap for SO-101 inference
+    stats_buffer: str = "so100.buffer"
+    train_dataset: str | None = None
+    train_steps: int = 20_000
+    train_batch_size: int = 64
+    output_dir: str = "outputs/train/sarm101_smolvla"
 
 
 @dataclass
@@ -184,8 +310,12 @@ class ProjectConfig:
     teleop: TeleopSettings = field(default_factory=TeleopSettings)
     cameras: dict[str, CameraSettings] = field(default_factory=dict)
     dataset: DatasetSettings = field(default_factory=DatasetSettings)
+    policy: PolicySettings = field(default_factory=PolicySettings)
     lelab: LeLabSettings = field(default_factory=LeLabSettings)
     sim: SimSettings = field(default_factory=SimSettings)
+    genesis: GenesisSettings = field(default_factory=GenesisSettings)
+    twin: TwinSettings = field(default_factory=TwinSettings)
+    servo: ServoSettings = field(default_factory=ServoSettings)
     motors: dict[str, MotorMapSettings] = field(
         default_factory=lambda: {
             "follower": MotorMapSettings(),
@@ -281,8 +411,32 @@ class ProjectConfig:
             for name, cam_cfg in raw.get("cameras", {}).items()
         }
         dataset = DatasetSettings(**raw.get("dataset", {}))
+        policy = PolicySettings(**raw.get("policy", {}))
         lelab = LeLabSettings(**raw.get("lelab", {}))
         sim = SimSettings(**raw.get("sim", {}))
+        genesis_raw = raw.get("genesis", {})
+        genesis_cameras = {
+            name: GenesisCameraSettings(**cam)
+            for name, cam in genesis_raw.get("cameras", {}).items()
+        }
+        genesis_joints = {
+            name: GenesisJointSettings(**spec)
+            for name, spec in genesis_raw.get("joints", {}).items()
+            if isinstance(spec, dict)
+        }
+        genesis_kwargs = {
+            k: v for k, v in genesis_raw.items() if k not in ("cameras", "joints")
+        }
+        if genesis_cameras:
+            genesis_kwargs["cameras"] = genesis_cameras
+        if genesis_joints:
+            default_joints = _default_genesis_joints()
+            for name, spec in genesis_joints.items():
+                default_joints[name] = spec
+            genesis_kwargs["joints"] = default_joints
+        genesis = GenesisSettings(**genesis_kwargs)
+        twin = TwinSettings(**raw.get("twin", {}))
+        servo = ServoSettings(**raw.get("servo", {}))
         motors_raw = raw.get("motors", {})
         motors = {
             role: MotorMapSettings.from_yaml(motors_raw.get(role))
@@ -296,8 +450,12 @@ class ProjectConfig:
             teleop=teleop,
             cameras=cameras,
             dataset=dataset,
+            policy=policy,
             lelab=lelab,
             sim=sim,
+            genesis=genesis,
+            twin=twin,
+            servo=servo,
             motors=motors,
             _geometry=geometry,
             _joints=joints,
@@ -312,16 +470,9 @@ class ProjectConfig:
         return root
 
     def cameras_lerobot_dict(self) -> dict[str, dict[str, Any]]:
-        return {
-            name: {
-                "type": cam.type,
-                "index_or_path": cam.index_or_path,
-                "width": cam.width,
-                "height": cam.height,
-                "fps": cam.fps,
-            }
-            for name, cam in self.cameras.items()
-        }
+        from .cameras import camera_to_lerobot_dict
+
+        return {name: camera_to_lerobot_dict(cam) for name, cam in self.cameras.items()}
 
 
 def _load_poses(raw: dict[str, Any]) -> tuple[dict[str, dict[str, float]], tuple[str, ...]]:

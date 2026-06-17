@@ -6,6 +6,7 @@ import subprocess
 import sys
 import webbrowser
 
+from .cameras import build_robot_camera_configs
 from .config import ProjectConfig
 from .robot import (
     _motor_write_retries,
@@ -15,20 +16,6 @@ from .robot import (
 )
 
 
-def _build_robot_camera_configs(cfg: ProjectConfig) -> dict:
-    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-
-    return {
-        name: OpenCVCameraConfig(
-            index_or_path=cam.index_or_path,
-            width=cam.width,
-            height=cam.height,
-            fps=cam.fps,
-        )
-        for name, cam in cfg.cameras.items()
-    }
-
-
 def teleop_leader(
     follower_port: str | None = None,
     leader_port: str | None = None,
@@ -36,6 +23,7 @@ def teleop_leader(
     with_cameras: bool = False,
 ) -> None:
     """Teleoperate S-ARM101 follower with a matching leader arm via USB."""
+    import rerun as rr
     from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
@@ -44,8 +32,6 @@ def teleop_leader(
     from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
     from lerobot.utils.utils import init_logging
     from lerobot.utils.visualization_utils import init_rerun
-
-    import rerun as rr
 
     cfg = ProjectConfig.load()
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
@@ -71,7 +57,7 @@ def teleop_leader(
         use_degrees=cfg.robot.use_degrees,
         max_relative_target=cfg.robot.max_relative_target,
         disable_torque_on_disconnect=cfg.robot.disable_torque_on_disconnect,
-        cameras=_build_robot_camera_configs(cfg) if with_cameras else {},
+        cameras=build_robot_camera_configs(cfg) if with_cameras else {},
     )
     leader_cfg = SO101LeaderConfig(
         id=cfg.teleop.leader.id,
@@ -106,8 +92,8 @@ def teleop_leader(
         print(
             "\nLost contact with a servo while connecting the follower or leader.\n"
             "This is usually a loose daisy-chain cable or insufficient 12V power.\n"
-            f"\n  sarm-hand test-motors --role follower\n"
-            f"  sarm-hand test-motors --role leader\n"
+            "\n  sarm-hand test-motors --role follower\n"
+            "  sarm-hand test-motors --role leader\n"
             "\nReseat the 3-pin cable at the joint mentioned in the error, then retry.",
             file=sys.stderr,
         )

@@ -8,6 +8,7 @@ import yaml
 
 from .config import JOINT_NAMES, PROJECT_ROOT, ProjectConfig
 from .kinematics import ArmGeometry, JointMap, KINEMATIC_JOINTS
+from .servo import export_servo_dict
 
 GEOMETRY_SCALAR_KEYS = (
     "units",
@@ -120,6 +121,7 @@ def export_robot_yaml(config: ProjectConfig) -> dict[str, Any]:
 
     return {
         "geometry": geom_raw,
+        "servo": export_servo_dict(config),
         "joints": joints_list,
         "poses": poses,
         "home": home_values,

@@ -228,6 +228,8 @@ def launch_sim(
     import uvicorn
     import webbrowser
 
+    from .servo import servo_summary
+
     cfg = _load()
     bind_host = host or cfg.sim.host
     bind_port = port or cfg.sim.port
@@ -237,6 +239,7 @@ def launch_sim(
         webbrowser.open(url)
 
     print(f"sarm-hand 3D sim  {url}")
+    print(f"servos           {servo_summary(cfg)}")
     print(f"config           {PROJECT_ROOT / 'config' / 'default.yaml'}")
     print(f"robot.yaml       http://{bind_host}:{bind_port}/robot.yaml")
     print("Ctrl+C to stop")
