@@ -54,6 +54,11 @@ dataset:
   reset_time_s: 10
   push_to_hub: false
 
+# Lightweight leader demos for `sarm-hand task record` / `task replay` (JSON under data/tasks/)
+tasks:
+  root: data/tasks
+  fps: 30
+
 # Genesis World physics sim — `uv sync --extra genesis` then ./scripts/fetch_so101_assets.sh
 genesis:
   urdf: assets/robots/so101/so101_new_calib.urdf

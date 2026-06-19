@@ -10,6 +10,7 @@ from . import __version__
 from .cameras import describe_camera, list_usb_cameras, preview_camera, test_configured_cameras
 from .config import JOINT_NAMES, ProjectConfig, parse_initial_ids
 from .data import dataset_export_episode, dataset_info, dataset_push, dataset_sample
+from .joint_signal_log import run_joint_signal_log
 from .lelab_ui import (
     install_lelab,
     launch_lelab,
@@ -18,14 +19,21 @@ from .lelab_ui import (
     viz_dataset_local,
 )
 from .policy import run_smolvla, train_smolvla
+from .poses import test_poses
 from .record import record_leader, record_policy, record_quest
 from .record_sim import record_sim, record_twin
+from .robot import (
+    calibrate,
+    disable_arm_torque,
+    find_port,
+    resolve_role_port,
+    setup_motors,
+    test_motors,
+)
 from .sim_api import launch_sim
-from .twin import run_genesis_spike, run_twin
-from .poses import list_poses, test_poses
-from .joint_signal_log import run_joint_signal_log
-from .robot import calibrate, disable_arm_torque, find_port, resolve_role_port, setup_motors, test_motors
+from .task_motion import list_task_motions, record_task_motion, replay_task_motion, show_task_motion
 from .teleop import teleop_leader, teleop_quest, teleop_quest_instructions
+from .twin import run_genesis_spike, run_twin
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -158,6 +166,58 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-episodes", type=int, default=None)
     p.add_argument("--single-task", default=None)
     p.add_argument("--push-to-hub", action=argparse.BooleanOptionalAction, default=None)
+
+    task_p = sub.add_parser(
+        "task",
+        help="Record leader demos and replay them on the follower by task name",
+    )
+    task_sub = task_p.add_subparsers(dest="task_command", required=True)
+
+    p = task_sub.add_parser("record", help="Record a leader-arm demo for a task")
+    p.add_argument(
+        "--task",
+        required=True,
+        help='Task label, e.g. "Pick up the cube and place it in the box"',
+    )
+    p.add_argument("--leader-port", default=None)
+    p.add_argument("--follower-port", default=None)
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Sample rate (default: tasks.fps in config)",
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Max seconds (default: until Ctrl+C)",
+    )
+    p.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Record leader only; do not mirror to follower during capture",
+    )
+
+    p = task_sub.add_parser("replay", help="Replay a saved task demo on the follower")
+    p.add_argument("--task", default=None, help="Task label (uses slug derived from text)")
+    p.add_argument("--task-slug", default=None, help="Task folder slug, e.g. pick_up_the_cube")
+    p.add_argument(
+        "--demo",
+        default="latest",
+        help="Demo id or 'latest' (default: latest)",
+    )
+    p.add_argument("--follower-port", default=None)
+    p.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
+    p.add_argument("--loop", action="store_true", help="Repeat until Ctrl+C")
+    p.add_argument("--pause", type=float, default=2.0, help="Seconds before motion starts")
+
+    task_sub.add_parser("list", help="List recorded task demos")
+
+    p = task_sub.add_parser("info", help="Show metadata for one task demo")
+    p.add_argument("--task", default=None)
+    p.add_argument("--task-slug", default=None)
+    p.add_argument("--demo", default="latest")
 
     p = sub.add_parser("record-quest", help="Quest 2 recording instructions")
     p.add_argument("--repo-id", default=None)
@@ -421,6 +481,41 @@ def main() -> None:
                 args.single_task,
                 args.push_to_hub,
             )
+        case "task":
+            match args.task_command:
+                case "record":
+                    record_task_motion(
+                        task=args.task,
+                        leader_port=args.leader_port,
+                        follower_port=args.follower_port,
+                        fps=args.fps,
+                        duration_s=args.duration,
+                        mirror_follower=not args.no_mirror,
+                    )
+                case "replay":
+                    if not args.task and not args.task_slug:
+                        print("Provide --task or --task-slug.", file=sys.stderr)
+                        sys.exit(2)
+                    replay_task_motion(
+                        task=args.task,
+                        task_slug=args.task_slug,
+                        demo_id=args.demo,
+                        follower_port=args.follower_port,
+                        speed=args.speed,
+                        loop=args.loop,
+                        pause_s=args.pause,
+                    )
+                case "list":
+                    list_task_motions()
+                case "info":
+                    if not args.task and not args.task_slug:
+                        print("Provide --task or --task-slug.", file=sys.stderr)
+                        sys.exit(2)
+                    show_task_motion(
+                        task=args.task,
+                        task_slug=args.task_slug,
+                        demo_id=args.demo,
+                    )
         case "record-quest":
             record_quest(args.repo_id, args.push_to_hub)
         case "record-policy":

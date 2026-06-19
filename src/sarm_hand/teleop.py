@@ -8,6 +8,7 @@ import webbrowser
 
 from .cameras import build_robot_camera_configs
 from .config import ProjectConfig
+from .rerun_viz import init_leader_teleop_rerun, leader_teleop_loop
 from .robot import (
     _motor_write_retries,
     disable_arm_torque,
@@ -27,11 +28,9 @@ def teleop_leader(
     from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
-    from lerobot.scripts.lerobot_teleoperate import teleop_loop
     from lerobot.teleoperators.so_leader import SO101Leader
     from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
     from lerobot.utils.utils import init_logging
-    from lerobot.utils.visualization_utils import init_rerun
 
     cfg = ProjectConfig.load()
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
@@ -67,18 +66,22 @@ def teleop_leader(
 
     init_logging()
     if display_data:
-        init_rerun(session_name="teleoperation")
+        init_leader_teleop_rerun(session_name="teleoperation", with_cameras=with_cameras)
+        print("Rerun: follower/leader joint graphs should open automatically.")
+        print("  Timeline: step  |  Entities: motors/follower/*, motors/leader/*")
 
     robot = SO101Follower(robot_cfg)
     teleop = SO101Leader(leader_cfg)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
 
     print("Starting teleoperation (Ctrl+C to stop)...")
     try:
         with _motor_write_retries():
             teleop.connect()
             robot.connect()
-        teleop_loop(
+        leader_teleop_loop(
             teleop=teleop,
             robot=robot,
             fps=60,

@@ -137,7 +137,7 @@ def _default_genesis_cameras() -> dict[str, GenesisCameraSettings]:
     }
 
 
-def _default_genesis_joints() -> dict[str, "GenesisJointSettings"]:
+def _default_genesis_joints() -> dict[str, GenesisJointSettings]:
     """URDF axis sign vs LeRobot positive direction (not the 2D FK geometry block)."""
     return {
         name: GenesisJointSettings(sign=sign)
@@ -247,6 +247,14 @@ class DatasetSettings:
 
 
 @dataclass
+class TaskSettings:
+    """Lightweight leader-demo storage for task replay (JSON under data/tasks/)."""
+
+    root: str = "data/tasks"
+    fps: int = 30
+
+
+@dataclass
 class PolicySettings:
     """SmolVLA / LeRobot policy settings."""
 
@@ -310,6 +318,7 @@ class ProjectConfig:
     teleop: TeleopSettings = field(default_factory=TeleopSettings)
     cameras: dict[str, CameraSettings] = field(default_factory=dict)
     dataset: DatasetSettings = field(default_factory=DatasetSettings)
+    tasks: TaskSettings = field(default_factory=TaskSettings)
     policy: PolicySettings = field(default_factory=PolicySettings)
     lelab: LeLabSettings = field(default_factory=LeLabSettings)
     sim: SimSettings = field(default_factory=SimSettings)
@@ -411,6 +420,7 @@ class ProjectConfig:
             for name, cam_cfg in raw.get("cameras", {}).items()
         }
         dataset = DatasetSettings(**raw.get("dataset", {}))
+        tasks = TaskSettings(**raw.get("tasks", {}))
         policy = PolicySettings(**raw.get("policy", {}))
         lelab = LeLabSettings(**raw.get("lelab", {}))
         sim = SimSettings(**raw.get("sim", {}))
@@ -450,6 +460,7 @@ class ProjectConfig:
             teleop=teleop,
             cameras=cameras,
             dataset=dataset,
+            tasks=tasks,
             policy=policy,
             lelab=lelab,
             sim=sim,
@@ -465,6 +476,12 @@ class ProjectConfig:
 
     def resolve_dataset_root(self) -> Path:
         root = Path(self.dataset.root)
+        if not root.is_absolute():
+            root = PROJECT_ROOT / root
+        return root
+
+    def resolve_tasks_root(self) -> Path:
+        root = Path(self.tasks.root)
         if not root.is_absolute():
             root = PROJECT_ROOT / root
         return root

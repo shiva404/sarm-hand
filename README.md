@@ -291,6 +291,50 @@ On Quest 2:
 
 See `uv run sarm-hand teleop-quest-help` for full instructions.
 
+## Task motion (record & replay)
+
+Lightweight utility to **record a leader-arm demo for a named task** and **replay it on the follower** — useful for repeating pick-and-place motions without a full LeRobot dataset.
+
+Demos are saved as JSON under `data/tasks/<task_slug>/`.
+
+### Record a demo
+
+Move the leader arm through the task; the follower mirrors in real time. Press **Ctrl+C** when done.
+
+```bash
+uv run sarm-hand task record --task "Pick up the cube and place it in the box"
+
+# Optional flags
+uv run sarm-hand task record \
+  --task "Pick and place the pen" \
+  --fps 30 \
+  --duration 45 \
+  --no-mirror          # leader only, no follower mirroring during capture
+```
+
+### Replay a demo
+
+```bash
+# Latest demo for a task (slug derived from --task text)
+uv run sarm-hand task replay --task "Pick up the cube and place it in the box"
+
+# Or by slug / specific demo id
+uv run sarm-hand task replay --task-slug pick_up_the_cube_and_place_it_in_the_box
+uv run sarm-hand task replay --task-slug pick_and_place --demo demo_20260619_163045
+
+# Loop or change speed
+uv run sarm-hand task replay --task-slug pick_and_place --speed 0.75 --loop
+```
+
+### List and inspect
+
+```bash
+uv run sarm-hand task list
+uv run sarm-hand task info --task-slug pick_and_place --demo latest
+```
+
+Configure default sample rate in `config/default.yaml` under `tasks.fps` (default 30).
+
 ## Data Collection
 
 ### Leader-follower recording
