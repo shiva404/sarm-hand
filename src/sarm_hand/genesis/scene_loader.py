@@ -27,6 +27,7 @@ class SceneObjectSpec:
     radius: float | None = None
     height: float | None = None
     density: float | None = None
+    euler: tuple[float, float, float] | None = None  # degrees — rotate cylinder/box (e.g. lay pen flat)
 
     @property
     def initial_pos(self) -> np.ndarray:
@@ -103,6 +104,7 @@ def _parse_object(name: str, raw: dict[str, Any]) -> SceneObjectSpec:
         radius=float(raw["radius"]) if "radius" in raw else None,
         height=float(raw["height"]) if "height" in raw else None,
         density=float(raw["density"]) if "density" in raw else None,
+        euler=_vec3(raw.get("euler"), (0.0, 0.0, 0.0)) if raw.get("euler") is not None else None,
     )
 
 
@@ -167,6 +169,8 @@ def build_surface(gs, spec: SceneObjectSpec):
 def build_morph(gs, spec: SceneObjectSpec):
     """Create a Genesis morph from object spec."""
     kwargs: dict[str, Any] = {"pos": spec.pos, "fixed": spec.fixed}
+    if spec.euler is not None:
+        kwargs["euler"] = spec.euler
     if spec.shape == "box":
         if spec.size is None:
             raise ValueError(f"Object {spec.name!r}: box requires size [x, y, z]")

@@ -65,19 +65,19 @@ genesis:
   backend: auto              # auto | metal | cuda | cpu (auto → Metal on Apple Silicon)
   # Rest pose from `sarm-hand test-motors` (Present_Position, torque off). Converted via calibration.
   home_raw:
-    shoulder_pan: 2375
-    shoulder_lift: 2119
-    elbow_flex: 2031
-    wrist_flex: 2028
-    wrist_roll: 2050
-    gripper: 2414
+    shoulder_pan: 2357
+    shoulder_lift: 2146
+    elbow_flex: 2060
+    wrist_flex: 1912
+    wrist_roll: 1995
+    gripper: 2495
   calibration_role: leader     # leader | follower — LeRobot cal file for norm↔URDF mapping
   # Wide cal joints (0..4095): map norm linearly to new_calib URDF limits; home anchored via
   # legacy limits + frame_offset so leader norm gain ≈ 1° per unit (not compressed ~50%).
   joints:
     shoulder_pan:  { sign: -1 }
-    shoulder_lift: { sign:  1, urdf_min: -3.31613, urdf_max: 0.174533, frame_offset: 1.5708 }
-    elbow_flex:    { sign:  1, urdf_min: -0.174533, urdf_max: 3.14159, frame_offset: -1.5708 }
+    shoulder_lift: { sign:  1, frame_offset: -1.5708 }
+    elbow_flex:    { sign:  1, frame_offset: 1.5708 }
     wrist_flex:    { sign:  1 }
     wrist_roll:    { sign: -1 }
     gripper:       { sign:  1 }

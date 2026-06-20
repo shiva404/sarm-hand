@@ -17,10 +17,14 @@ def _policy_fps(cfg: ProjectConfig) -> int:
     return cfg.policy.control_fps
 
 
-def build_policy_rename_map(cfg: ProjectConfig) -> dict[str, str]:
+def build_policy_rename_map(cfg: ProjectConfig, *, genesis: bool = False) -> dict[str, str]:
     """Map observation.images.<robot_cam> → observation.images.<policy_cam>."""
     mapping = dict(cfg.policy.camera_map)
-    if not mapping and cfg.cameras:
+    if genesis:
+        if not mapping and cfg.genesis.cameras:
+            first = next(iter(cfg.genesis.cameras))
+            mapping[first] = "camera1"
+    elif not mapping and cfg.cameras:
         first = next(iter(cfg.cameras))
         mapping[first] = "camera1"
     return {
@@ -29,10 +33,11 @@ def build_policy_rename_map(cfg: ProjectConfig) -> dict[str, str]:
     }
 
 
-def apply_smolvla_policy_overrides(policy_cfg, cfg: ProjectConfig) -> None:
+def apply_smolvla_policy_overrides(policy_cfg, cfg: ProjectConfig, *, genesis: bool = False) -> None:
     """Tune SmolVLA config for the number of physical cameras available."""
     empty = cfg.policy.empty_cameras
-    if empty is None and len(cfg.cameras) == 1:
+    cam_count = len(cfg.genesis.cameras) if genesis else len(cfg.cameras)
+    if empty is None and cam_count == 1:
         empty = 2
     if empty is not None:
         policy_cfg.empty_cameras = empty
@@ -144,28 +149,55 @@ def _log_action_step(step: int, obs: dict, sent: dict) -> None:
     )
 
 
-def _smolvla_record_flags(cfg: ProjectConfig) -> list[str]:
+def _smolvla_record_flags(cfg: ProjectConfig, *, genesis: bool = False) -> list[str]:
     """Extra lerobot-record flags for SmolVLA camera mapping."""
     flags: list[str] = []
-    rename_map = build_policy_rename_map(cfg)
+    rename_map = build_policy_rename_map(cfg, genesis=genesis)
     if rename_map:
         flags.append(f"--dataset.rename_map={rename_map!r}")
     empty = cfg.policy.empty_cameras
-    if empty is None and len(cfg.cameras) == 1:
+    cam_count = len(cfg.genesis.cameras) if genesis else len(cfg.cameras)
+    if empty is None and cam_count == 1:
         empty = 2
     if empty is not None:
         flags.append(f"--policy.empty_cameras={empty}")
     return flags
 
 
-def ensure_smolvla() -> None:
+def _use_genesis_policy(cfg: ProjectConfig, genesis: bool | None) -> bool:
+    if genesis is not None:
+        return genesis
+    return cfg.robot.backend.lower() in ("genesis", "sim")
+
+
+def _require_policy_cameras(cfg: ProjectConfig, *, genesis: bool) -> None:
+    if genesis:
+        if not cfg.genesis.cameras:
+            print(
+                "Genesis SmolVLA needs at least one camera under genesis.cameras in config/default.yaml.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        return
+    _require_cameras(cfg)
+
+
+def ensure_smolvla(*, genesis: bool = False) -> None:
     """Verify SmolVLA dependencies are installed."""
-    try:
-        import transformers  # noqa: F401
-    except ImportError:
+    missing: list[str] = []
+    for module in ("transformers", "torch"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        extras = "sim-policy" if genesis else "smolvla"
+        alt = "genesis --extra smolvla" if genesis else "smolvla"
         print(
-            "SmolVLA requires extra dependencies.\n"
-            "Install with:  uv sync --extra smolvla",
+            f"SmolVLA is missing: {', '.join(missing)}\n"
+            f"Install with:  uv sync --extra {extras}\n"
+            f"  (or: uv sync --extra {alt})\n"
+            "\nuv extras are per-sync — passing only --extra genesis does not install smolvla.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -181,6 +213,50 @@ def resolve_device(device: str | None) -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _move_tree_to_device(value, device):
+    """Recursively move tensors in nested dicts/lists to *device*."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: _move_tree_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_move_tree_to_device(v, device) for v in value)
+    return value
+
+
+def _predict_action_on_device(
+    observation: dict,
+    *,
+    policy,
+    device: torch.device,
+    preprocessor,
+    postprocessor,
+    use_amp: bool,
+    task: str | None,
+    robot_type: str | None,
+):
+    """Like ``lerobot.utils.control_utils.predict_action`` but fixes CPU/MPS drift after normalizer."""
+    from contextlib import nullcontext
+    from copy import copy
+
+    import torch
+    from lerobot.policies.utils import prepare_observation_for_inference
+
+    observation = copy(observation)
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+    ):
+        observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        observation = preprocessor(observation)
+        observation = _move_tree_to_device(observation, device)
+        action = policy.select_action(observation)
+        action = postprocessor(action)
+    return action
 
 
 def _require_cameras(cfg: ProjectConfig) -> None:
@@ -233,10 +309,11 @@ def _policy_episode(
     from lerobot.datasets.feature_utils import build_dataset_frame
     from lerobot.policies.utils import make_robot_action
     from lerobot.utils.constants import OBS_STR
-    from lerobot.utils.control_utils import predict_action
     from lerobot.utils.device_utils import get_safe_torch_device
     from lerobot.utils.robot_utils import precise_sleep
     from lerobot.utils.visualization_utils import log_rerun_data
+
+    policy_device = get_safe_torch_device(policy.config.device)
 
     policy.reset()
     preprocessor.reset()
@@ -257,10 +334,10 @@ def _policy_episode(
             obs_processed = robot_observation_processor(obs)
             observation_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
 
-            action_tensor = predict_action(
-                observation=observation_frame,
+            action_tensor = _predict_action_on_device(
+                observation_frame,
                 policy=policy,
-                device=get_safe_torch_device(policy.config.device),
+                device=policy_device,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 use_amp=policy.config.use_amp,
@@ -284,6 +361,119 @@ def _policy_episode(
         print("\nStopped early.")
 
 
+def _load_smolvla_stack(
+    cfg: ProjectConfig,
+    *,
+    policy_path: str,
+    device: str,
+    robot,
+    genesis: bool,
+):
+    """Build policy, processors, and dataset features for one inference episode."""
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.policies.factory import make_policy, make_pre_post_processors
+    from lerobot.processor import make_default_processors
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
+    features = _build_dataset_features(
+        robot, teleop_action_processor, robot_observation_processor
+    )
+
+    policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
+    policy_cfg.pretrained_path = policy_path
+    policy_cfg.device = device
+    apply_smolvla_policy_overrides(policy_cfg, cfg, genesis=genesis)
+    rename_map = build_policy_rename_map(cfg, genesis=genesis)
+
+    norm_stats = resolve_policy_normalization_stats(cfg, policy_path, rename_map=rename_map)
+
+    dataset_root = Path(tempfile.mkdtemp(prefix="sarm-hand-smolvla-")) / "local/sarm101-inference-scratch"
+    dataset = LeRobotDataset.create(
+        repo_id="local/sarm101-inference-scratch",
+        fps=_policy_fps(cfg),
+        root=dataset_root,
+        robot_type=robot.name,
+        features=features,
+        use_videos=True,
+        image_writer_processes=0,
+        image_writer_threads=0,
+    )
+
+    policy = make_policy(policy_cfg, ds_meta=dataset.meta, rename_map=rename_map)
+
+    preprocessor_overrides: dict = {
+        "device_processor": {"device": policy_cfg.device},
+        "rename_observations_processor": {"rename_map": rename_map},
+    }
+    postprocessor_overrides: dict = {}
+    if norm_stats:
+        preprocessor_overrides["normalizer_processor"] = {
+            "stats": norm_stats,
+            "device": device,
+        }
+        postprocessor_overrides["unnormalizer_processor"] = {"stats": norm_stats}
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy_cfg,
+        pretrained_path=policy_path,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
+
+    return {
+        "policy": policy,
+        "preprocessor": preprocessor,
+        "postprocessor": postprocessor,
+        "robot_action_processor": robot_action_processor,
+        "robot_observation_processor": robot_observation_processor,
+        "features": features,
+        "rename_map": rename_map,
+        "policy_cfg": policy_cfg,
+        "norm_stats": norm_stats,
+    }
+
+
+def _print_smolvla_header(
+    *,
+    policy_path: str,
+    device: str,
+    task: str,
+    genesis: bool,
+    cfg: ProjectConfig,
+    rename_map: dict[str, str],
+    policy_cfg,
+    norm_stats,
+    follower_port: str | None = None,
+) -> None:
+    print("SmolVLA inference")
+    print(f"  Policy:  {policy_path}")
+    print(f"  Device:  {device}")
+    if genesis:
+        print(f"  Backend: Genesis ({cfg.genesis.scene})")
+        print(f"  Cameras: {list(cfg.genesis.cameras.keys())} (rendered)")
+        print(f"  Headless: {cfg.genesis.headless}")
+    else:
+        print(f"  Robot:   {follower_port}")
+        print(f"  Cameras: {list(cfg.cameras.keys())}")
+    if rename_map:
+        print(f"  Camera map: {rename_map}")
+    if getattr(policy_cfg, "empty_cameras", 0):
+        print(f"  Empty camera slots: {policy_cfg.empty_cameras} (zero-padded)")
+    if policy_path == "lerobot/smolvla_base":
+        print(
+            "\n  Note: smolvla_base is pretrained on community data. "
+            "For reliable SO-101 tasks, fine-tune on your demos:\n"
+            "    uv sync --extra smolvla\n"
+            "    sarm-hand train-smolvla --dataset-repo-id local/your-dataset\n"
+        )
+    if norm_stats:
+        print(f"  Norm stats: {cfg.policy.stats_buffer} buffer remap")
+    print(f"  Task:    {task!r}\n")
+
+
 def run_smolvla(
     task: str | None = None,
     *,
@@ -296,13 +486,34 @@ def run_smolvla(
     repo_id: str | None = None,
     num_episodes: int = 1,
     interactive: bool = False,
+    genesis: bool | None = None,
+    headless: bool | None = None,
 ) -> None:
-    """Run SmolVLA on the follower arm with a natural-language task query."""
-    ensure_smolvla()
+    """Run SmolVLA with a natural-language task on hardware or Genesis sim."""
     cfg = ProjectConfig.load()
-    _require_cameras(cfg)
+    use_genesis = _use_genesis_policy(cfg, genesis)
+    ensure_smolvla(genesis=use_genesis)
+    if use_genesis:
+        from .genesis.deps import ensure_genesis
 
-    follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
+        ensure_genesis()
+    _require_policy_cameras(cfg, genesis=use_genesis)
+
+    if record and use_genesis:
+        print(
+            "Genesis policy recording is not supported yet. "
+            "Use: sarm-hand run-smolvla --genesis --task \"...\"",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    resolved_follower_port: str | None = None
+    if use_genesis:
+        if headless is not None:
+            cfg.genesis.headless = headless
+    else:
+        resolved_follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
+
     resolved_policy = policy_path or cfg.policy.path
     resolved_device = resolve_device(device or cfg.policy.device)
     resolved_episode_s = (
@@ -312,7 +523,7 @@ def run_smolvla(
     if record:
         _run_smolvla_record(
             cfg,
-            follower_port=follower_port,
+            follower_port=resolved_follower_port,
             policy_path=resolved_policy,
             task=task or cfg.dataset.single_task,
             episode_time_s=resolved_episode_s,
@@ -322,38 +533,63 @@ def run_smolvla(
         )
         return
 
+    run_one = (
+        _run_smolvla_genesis_inference if use_genesis else _run_smolvla_inference
+    )
+
     if interactive:
-        print("SmolVLA interactive mode — enter a task query per episode.")
+        label = "Genesis sim" if use_genesis else "follower arm"
+        print(f"SmolVLA interactive mode ({label}) — enter a task query per episode.")
         print("Press Enter on an empty line to quit.\n")
         while True:
             query = input("Task: ").strip()
             if not query:
                 break
-            _run_smolvla_inference(
-                cfg,
-                task=query,
-                follower_port=follower_port,
-                policy_path=resolved_policy,
-                episode_time_s=resolved_episode_s,
-                display_data=display_data,
-                device=resolved_device,
-            )
+            if use_genesis:
+                run_one(
+                    cfg,
+                    task=query,
+                    policy_path=resolved_policy,
+                    episode_time_s=resolved_episode_s,
+                    display_data=display_data,
+                    device=resolved_device,
+                )
+            else:
+                run_one(
+                    cfg,
+                    task=query,
+                    follower_port=resolved_follower_port,
+                    policy_path=resolved_policy,
+                    episode_time_s=resolved_episode_s,
+                    display_data=display_data,
+                    device=resolved_device,
+                )
             print()
         return
 
     if not task:
         print("Error: provide --task or use --interactive.", file=sys.stderr)
-        sys.exit(1)
+        raise SystemExit(1)
 
-    _run_smolvla_inference(
-        cfg,
-        task=task,
-        follower_port=follower_port,
-        policy_path=resolved_policy,
-        episode_time_s=resolved_episode_s,
-        display_data=display_data,
-        device=resolved_device,
-    )
+    if use_genesis:
+        run_one(
+            cfg,
+            task=task,
+            policy_path=resolved_policy,
+            episode_time_s=resolved_episode_s,
+            display_data=display_data,
+            device=resolved_device,
+        )
+    else:
+        run_one(
+            cfg,
+            task=task,
+            follower_port=resolved_follower_port,
+            policy_path=resolved_policy,
+            episode_time_s=resolved_episode_s,
+            display_data=display_data,
+            device=resolved_device,
+        )
 
 
 def _run_smolvla_inference(
@@ -367,17 +603,12 @@ def _run_smolvla_inference(
     device: str,
 ) -> None:
     import rerun as rr
-    from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.policies.factory import make_policy, make_pre_post_processors
-    from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
     from lerobot.utils.utils import init_logging
     from lerobot.utils.visualization_utils import init_rerun
 
     init_logging()
-
     require_all_motors("follower", follower_port, context="run SmolVLA")
 
     robot_cfg = SOFollowerRobotConfig(
@@ -388,108 +619,130 @@ def _run_smolvla_inference(
         disable_torque_on_disconnect=cfg.robot.disable_torque_on_disconnect,
         cameras=build_robot_camera_configs(cfg),
     )
-
-    teleop_action_processor, robot_action_processor, robot_observation_processor = (
-        make_default_processors()
-    )
-
     robot = SO101Follower(robot_cfg)
-    features = _build_dataset_features(
-        robot, teleop_action_processor, robot_observation_processor
+    stack = _load_smolvla_stack(
+        cfg, policy_path=policy_path, device=device, robot=robot, genesis=False
     )
-
-    policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
-    policy_cfg.pretrained_path = policy_path
-    policy_cfg.device = device
-    apply_smolvla_policy_overrides(policy_cfg, cfg)
-    rename_map = build_policy_rename_map(cfg)
-
-    print("SmolVLA inference")
-    print(f"  Policy:  {policy_path}")
-    print(f"  Device:  {device}")
-    print(f"  Robot:   {follower_port}")
-    print(f"  Cameras: {list(cfg.cameras.keys())}")
-    if rename_map:
-        print(f"  Camera map: {rename_map}")
-    if getattr(policy_cfg, "empty_cameras", 0):
-        print(f"  Empty camera slots: {policy_cfg.empty_cameras} (zero-padded)")
-    if policy_path == "lerobot/smolvla_base":
-        print(
-            "\n  Note: smolvla_base is pretrained on community data. "
-            "For reliable SO-101 tasks, fine-tune on your demos:\n"
-            "    uv sync --extra smolvla\n"
-            "    sarm-hand train-smolvla --dataset-repo-id local/your-dataset\n"
-        )
-
-    norm_stats = resolve_policy_normalization_stats(cfg, policy_path, rename_map=rename_map)
-    if norm_stats:
-        print(f"  Norm stats: {cfg.policy.stats_buffer} buffer remap")
+    _print_smolvla_header(
+        policy_path=policy_path,
+        device=device,
+        task=task,
+        genesis=False,
+        cfg=cfg,
+        rename_map=stack["rename_map"],
+        policy_cfg=stack["policy_cfg"],
+        norm_stats=stack["norm_stats"],
+        follower_port=follower_port,
+    )
 
     if display_data:
         init_rerun(session_name="smolvla")
 
-    with tempfile.TemporaryDirectory(prefix="sarm-hand-smolvla-") as tmp:
-        # LeRobotDataset.create() mkdirs root itself — use a child path, not tmp directly.
-        dataset_root = Path(tmp) / "local/sarm101-inference-scratch"
-        dataset = LeRobotDataset.create(
-            repo_id="local/sarm101-inference-scratch",
+    try:
+        with _motor_write_retries():
+            robot.connect()
+        _policy_episode(
+            robot=robot,
+            policy=stack["policy"],
+            preprocessor=stack["preprocessor"],
+            postprocessor=stack["postprocessor"],
+            robot_action_processor=stack["robot_action_processor"],
+            robot_observation_processor=stack["robot_observation_processor"],
+            features=stack["features"],
+            task=task,
             fps=_policy_fps(cfg),
-            root=dataset_root,
-            robot_type=robot.name,
-            features=features,
-            use_videos=True,
-            image_writer_processes=0,
-            image_writer_threads=0,
+            episode_time_s=episode_time_s,
+            display_data=display_data,
         )
-
-        policy = make_policy(policy_cfg, ds_meta=dataset.meta, rename_map=rename_map)
-
-        preprocessor_overrides: dict = {
-            "device_processor": {"device": policy_cfg.device},
-            "rename_observations_processor": {"rename_map": rename_map},
-        }
-        postprocessor_overrides: dict = {}
-        if norm_stats:
-            preprocessor_overrides["normalizer_processor"] = {"stats": norm_stats}
-            postprocessor_overrides["unnormalizer_processor"] = {"stats": norm_stats}
-
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=policy_cfg,
-            pretrained_path=policy_path,
-            preprocessor_overrides=preprocessor_overrides,
-            postprocessor_overrides=postprocessor_overrides,
+    except ConnectionError as exc:
+        print(
+            "\nLost contact with a servo while connecting the follower.\n"
+            "This is usually a loose daisy-chain cable or insufficient 12V power.\n"
+            "\n  sarm-hand test-motors --role follower\n"
+            "\nReseat the 3-pin cable at the joint mentioned in the error, then retry.",
+            file=sys.stderr,
         )
+        raise SystemExit(1) from exc
+    finally:
+        if display_data:
+            rr.rerun_shutdown()
+        if robot.is_connected:
+            robot.disconnect()
 
-        try:
-            with _motor_write_retries():
-                robot.connect()
-            _policy_episode(
-                robot=robot,
-                policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                robot_action_processor=robot_action_processor,
-                robot_observation_processor=robot_observation_processor,
-                features=features,
-                task=task,
-                fps=_policy_fps(cfg),
-                episode_time_s=episode_time_s,
-                display_data=display_data,
-            )
-        except ConnectionError as exc:
-            print(
-                "\nLost contact with a servo while connecting the follower.\n"
-                "This is usually a loose daisy-chain cable or insufficient 12V power.\n"
-                "\n  sarm-hand test-motors --role follower\n"
-                "\nReseat the 3-pin cable at the joint mentioned in the error, then retry.",
-                file=sys.stderr,
-            )
-            raise SystemExit(1) from exc
-        finally:
-            if display_data:
-                rr.rerun_shutdown()
-            if robot.is_connected:
-                robot.disconnect()
+    print("Done.")
+
+
+def _run_smolvla_genesis_inference(
+    cfg: ProjectConfig,
+    *,
+    task: str,
+    policy_path: str,
+    episode_time_s: float,
+    display_data: bool,
+    device: str,
+) -> None:
+    import rerun as rr
+    from lerobot.utils.utils import init_logging
+    from lerobot.utils.visualization_utils import init_rerun
+
+    from .backends.genesis_sim import GenesisSimRobot
+    from .genesis.deps import ensure_genesis
+    from .genesis.shutdown import (
+        ensure_shutdown_handlers,
+        exit_after_interrupt,
+        install_shutdown_handlers,
+        shutdown_requested,
+    )
+
+    ensure_genesis()
+    install_shutdown_handlers()
+    init_logging()
+
+    robot = GenesisSimRobot(cfg)
+    stack = _load_smolvla_stack(
+        cfg, policy_path=policy_path, device=device, robot=robot, genesis=True
+    )
+    _print_smolvla_header(
+        policy_path=policy_path,
+        device=device,
+        task=task,
+        genesis=True,
+        cfg=cfg,
+        rename_map=stack["rename_map"],
+        policy_cfg=stack["policy_cfg"],
+        norm_stats=stack["norm_stats"],
+    )
+
+    if display_data:
+        init_rerun(session_name="smolvla-genesis")
+
+    interrupted = False
+    try:
+        ensure_shutdown_handlers()
+        robot.connect()
+        _policy_episode(
+            robot=robot,
+            policy=stack["policy"],
+            preprocessor=stack["preprocessor"],
+            postprocessor=stack["postprocessor"],
+            robot_action_processor=stack["robot_action_processor"],
+            robot_observation_processor=stack["robot_observation_processor"],
+            features=stack["features"],
+            task=task,
+            fps=_policy_fps(cfg),
+            episode_time_s=episode_time_s,
+            display_data=display_data,
+        )
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nStopped.")
+    finally:
+        if display_data:
+            rr.rerun_shutdown()
+        if robot.is_connected:
+            robot.disconnect()
+        if interrupted or shutdown_requested():
+            exit_after_interrupt()
 
     print("Done.")
 

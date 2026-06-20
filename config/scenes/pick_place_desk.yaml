@@ -1,8 +1,12 @@
 # Pick-and-place desk scene for Genesis sim.
 # Edit objects below — set enabled: false to remove, color as RGB 0–1 or hex.
 name: pick_place_desk
-description: SO-101 arm on a desk with pen and holder for sim-to-real twin tests.
+description: SO-101 arm on a desk with Sharpie pen and block cup holder for sim-to-real twin tests.
 task: "Pick up the pen and place it in the holder"
+
+# Pen layout (horizontal, lying on desk along +X):
+#   total length 0.135 m — 60% white barrel, 40% black cap
+#   euler [0, 90, 0] lays default Z-axis cylinders flat along X
 
 objects:
   desk:
@@ -13,20 +17,41 @@ objects:
     color: [0.45, 0.32, 0.18]
     surface: rough
 
-  pen:
+  pen_white:
     shape: cylinder
-    radius: 0.004
-    height: 0.12
-    pos: [0.28, 0.08, 0.08]
-    color: [0.15, 0.35, 0.85]
+    radius: 0.007
+    height: 0.081
+    pos: [0.253, 0.08, 0.027]
+    euler: [0, 90, 0]
+    color: "#f4f4f4"
     surface: plastic
 
-  holder:
+  pen_cap:
+    shape: cylinder
+    radius: 0.007
+    height: 0.054
+    pos: [0.3205, 0.08, 0.027]
+    euler: [0, 90, 0]
+    color: "#141414"
+    surface: plastic
+
+  # Block outer shell (dark square cup body)
+  holder_shell:
     shape: box
-    size: [0.04, 0.04, 0.06]
-    pos: [0.42, -0.08, 0.05]
+    size: [0.048, 0.048, 0.07]
+    pos: [0.42, -0.08, 0.055]
     fixed: true
-    color: [0.25, 0.25, 0.28]
+    color: "#1a1a1a"
+    surface: rough
+
+  # Metal-lined inner cup (cylinder visible at the opening)
+  holder_inner:
+    shape: cylinder
+    radius: 0.0155
+    height: 0.064
+    pos: [0.42, -0.08, 0.054]
+    fixed: true
+    color: [0.75, 0.77, 0.80]
     surface: aluminum
 
   # Optional extra props — toggle enabled or copy to add more objects

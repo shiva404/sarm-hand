@@ -12,11 +12,14 @@ from .base import RobotBackend
 class HardwareRobot(RobotBackend):
     """Wraps LeRobot SO101Follower."""
 
-    def __init__(self, port: str, cfg: ProjectConfig):
+    def __init__(self, port: str, cfg: ProjectConfig, *, use_cameras: bool = True):
         from lerobot.robots.so_follower import SO101Follower
         from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
-        cameras = build_robot_camera_configs(cfg) if cfg.cameras else {}
+        if use_cameras and cfg.cameras:
+            cameras = build_robot_camera_configs(cfg)
+        else:
+            cameras = {}
         robot_cfg = SOFollowerRobotConfig(
             id=cfg.robot.id,
             port=port,

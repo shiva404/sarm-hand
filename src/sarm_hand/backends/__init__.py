@@ -13,6 +13,7 @@ def build_robot_backend(
     *,
     config: ProjectConfig | None = None,
     connect: bool = False,
+    use_cameras: bool = True,
 ) -> RobotBackend:
     """Create a robot backend from config/default.yaml robot.backend."""
     cfg = config or ProjectConfig.load()
@@ -22,7 +23,7 @@ def build_robot_backend(
         from ..robot import ensure_port
 
         resolved_port = ensure_port(port or cfg.robot.port, "Follower")
-        robot = HardwareRobot(resolved_port, cfg)
+        robot = HardwareRobot(resolved_port, cfg, use_cameras=use_cameras)
     elif backend in ("genesis", "sim"):
         robot = GenesisSimRobot(cfg)
     elif backend == "twin":

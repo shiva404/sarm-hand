@@ -69,6 +69,8 @@ class GenesisSimRobot(RobotBackend):
             frame = self._scene.render_rgb(cam_name)
             if frame is not None:
                 obs[cam_name] = frame
+        if not self._cfg.genesis.headless:
+            self._scene.refresh_previews()
         return obs
 
     def send_action(self, action: dict[str, float]) -> dict[str, float]:

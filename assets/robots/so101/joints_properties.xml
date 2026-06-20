@@ -1,5 +1,4 @@
 <default>
-    <!-- ST-3215-C001 (sts3215): 1:345 gearbox, 4096 counts/rev — see config/default.yaml servo: -->
     <default class="sts3215">
         <geom contype="0" conaffinity="0"/>
         <joint damping="0.60" frictionloss="0.052" armature="0.028"/>

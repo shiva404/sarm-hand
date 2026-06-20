@@ -375,7 +375,7 @@ def replay_task_motion(
     print(f"\nStarting in {pause_s:.0f}s — reset the scene, then stand clear. Ctrl+C to stop.\n")
     time.sleep(pause_s)
 
-    robot = build_robot(port, cfg)
+    robot = build_robot(port, cfg, use_cameras=False)
     robot.config.max_relative_target = None
 
     if not robot.is_calibrated:

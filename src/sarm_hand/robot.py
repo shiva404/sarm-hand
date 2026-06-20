@@ -524,12 +524,12 @@ def calibrate(role: str, port: str, robot_id: str | None = None) -> None:
         raise SystemExit(130) from None
 
 
-def build_robot(port: str, config: ProjectConfig | None = None):
+def build_robot(port: str, config: ProjectConfig | None = None, *, use_cameras: bool = True):
     """Create a connected robot backend for programmatic use."""
     from .backends import build_robot_backend
 
     cfg = config or ProjectConfig.load()
-    robot = build_robot_backend(port, config=cfg, connect=True)
+    robot = build_robot_backend(port, config=cfg, connect=True, use_cameras=use_cameras)
     return robot.inner if hasattr(robot, "inner") else robot
 
 

@@ -252,6 +252,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo-id", default=None, help="Eval dataset repo id when --record")
     p.add_argument("--num-episodes", type=int, default=1)
     p.add_argument("--display-data", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--genesis",
+        action="store_true",
+        help="Run in Genesis sim (no USB arm; uses genesis.cameras for vision)",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Genesis without viewer windows (with --genesis)",
+    )
 
     p = sub.add_parser("train-smolvla", help="Fine-tune SmolVLA on a recorded dataset")
     p.add_argument("--dataset-repo-id", default=None)
@@ -365,6 +375,40 @@ def _build_parser() -> argparse.ArgumentParser:
         default=90.0,
         help="Sim travel angle for expected-pulse column (default: 90)",
     )
+
+    p = sub.add_parser(
+        "calibrate-genesis",
+        help="Mirror leader into Genesis; compare pulses, norm, and sim angles",
+    )
+    p.add_argument("--leader-port", default=None, help="Leader USB port (overrides config)")
+    p.add_argument("--rate", type=float, default=15.0, help="Live update rate (Hz)")
+    p.add_argument("--duration", type=float, default=None, help="Stop after N seconds (default: until Ctrl+C)")
+    p.add_argument(
+        "--capture-home",
+        action="store_true",
+        help="Read leader rest pose and print genesis.home_raw YAML (no live loop)",
+    )
+    p.add_argument(
+        "--save-home",
+        action="store_true",
+        help="With --capture-home, patch config/default.yaml genesis.home_raw",
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Config YAML path for --save-home (default: config/default.yaml)",
+    )
+    p.add_argument(
+        "--no-analysis",
+        action="store_true",
+        help="Skip static pulse/norm analysis table at startup",
+    )
+    p.add_argument(
+        "--measure",
+        action="store_true",
+        help="Interactive per-joint ~90° travel check before live mirror",
+    )
+    p.add_argument("--headless", action="store_true", help="Genesis without viewer window")
 
     p = sub.add_parser(
         "record-twin",
@@ -538,6 +582,8 @@ def main() -> None:
                 repo_id=args.repo_id,
                 num_episodes=args.num_episodes,
                 interactive=args.interactive,
+                genesis=args.genesis if args.genesis else None,
+                headless=args.headless if args.headless else None,
             )
         case "train-smolvla":
             train_smolvla(
@@ -621,6 +667,20 @@ def main() -> None:
                 rate_hz=args.rate,
                 output=Path(args.output) if args.output else None,
                 target_degrees=args.target_degrees,
+            )
+        case "calibrate-genesis":
+            from .genesis.leader_calib import run_genesis_leader_calib
+
+            run_genesis_leader_calib(
+                leader_port=args.leader_port,
+                rate_hz=args.rate,
+                duration_s=args.duration,
+                capture_home=args.capture_home,
+                save_home=args.save_home,
+                config_path=Path(args.config) if args.config else None,
+                print_analysis=not args.no_analysis,
+                measure_joints=args.measure,
+                headless=args.headless,
             )
         case "record-twin":
             record_twin(

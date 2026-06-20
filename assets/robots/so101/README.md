@@ -19,9 +19,7 @@ To switch between calibration methods, modify the included robot file in `scene.
 
 ## Motor Parameters
 
-All six joints use **Feetech ST-3215-C001** servos (`sts3215` in LeRobot) with a **1:345** metal gearbox and 12-bit magnetic encoder (4096 position counts per output revolution). Runtime values live in `config/default.yaml` under `servo:`.
-
-Motor MJCF properties (`joints_properties.xml`, class `sts3215`) are adapted from the [Open Duck Mini project](https://github.com/apirrone/Open_Duck_Mini). URDF `mechanicalReduction` is **1** — joint angles are at the gearbox output shaft, not the motor rotor.
+Motor properties for the STS3215 motors used in the robot are adapted from the [Open Duck Mini project](https://github.com/apirrone/Open_Duck_Mini).
 
 ## Gripper Note
 

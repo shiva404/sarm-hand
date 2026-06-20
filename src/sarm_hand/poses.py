@@ -108,7 +108,7 @@ def test_poses(
     print(f"  Tolerance: ±{tolerance} (gripper ±{tolerance * 1.5:.0f})")
     print("\nKeep clear of the arm. Ctrl+C to abort.\n")
 
-    robot = build_robot(resolved_port, cfg)
+    robot = build_robot(resolved_port, cfg, use_cameras=False)
 
     if not robot.is_calibrated:
         robot.disconnect()

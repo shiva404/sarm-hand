@@ -108,3 +108,67 @@ def test_resolve_demo_path_latest(tmp_path: Path):
 
     assert resolve_demo_path(cfg, task_slug=slug, demo_id="latest") == second
     assert list_demos(cfg, slug) == [first, second]
+
+
+def test_replay_skips_cameras(monkeypatch, tmp_path: Path):
+    """Task replay only drives joints — must not open configured cameras."""
+    cfg = ProjectConfig.load()
+    slug = "pick_and_place"
+    demo_path = tmp_path / slug / "demo_test.json"
+    demo_path.parent.mkdir(parents=True)
+    demo_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task": "Pick and place",
+                "task_slug": slug,
+                "demo_id": "demo_test",
+                "recorded_at": "",
+                "fps": 30,
+                "source": "leader",
+                "frames": [
+                    {
+                        "t": 0.0,
+                        "joints": {
+                            "shoulder_pan": 0.0,
+                            "shoulder_lift": 0.0,
+                            "elbow_flex": 0.0,
+                            "wrist_flex": 0.0,
+                            "wrist_roll": 0.0,
+                            "gripper": 50.0,
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    captured: dict[str, bool] = {}
+
+    class FakeRobot:
+        config = type("Cfg", (), {"max_relative_target": 10})()
+        is_calibrated = True
+        is_connected = True
+
+        def send_action(self, action):
+            return action
+
+        def disconnect(self):
+            pass
+
+    def fake_build_robot(port, config, *, use_cameras=True):
+        captured["use_cameras"] = use_cameras
+        return FakeRobot()
+
+    monkeypatch.setattr("sarm_hand.task_motion.ProjectConfig.load", lambda: cfg)
+    monkeypatch.setattr("sarm_hand.task_motion.resolve_demo_path", lambda *a, **k: demo_path)
+    monkeypatch.setattr("sarm_hand.task_motion.ensure_port", lambda port, label: port or "/dev/tty.test")
+    monkeypatch.setattr("sarm_hand.task_motion.require_all_motors", lambda *a, **k: None)
+    monkeypatch.setattr("sarm_hand.task_motion.build_robot", fake_build_robot)
+    monkeypatch.setattr("sarm_hand.task_motion.time.sleep", lambda _: None)
+
+    from sarm_hand.task_motion import replay_task_motion
+
+    replay_task_motion(task_slug=slug, demo_id="demo_test", pause_s=0)
+
+    assert captured.get("use_cameras") is False
