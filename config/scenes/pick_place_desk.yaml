@@ -4,53 +4,88 @@ name: pick_place_desk
 description: SO-101 arm on a desk with Sharpie pen and block cup holder for sim-to-real twin tests.
 task: "Pick up the pen and place it in the holder"
 
-# Pen layout (horizontal, lying on desk along +X):
-#   total length 0.135 m — 60% white barrel, 40% black cap
-#   euler [0, 90, 0] lays default Z-axis cylinders flat along X
+# Workspace layout (arm base at origin, yawed to face +X):
+#   Desk ~18–28 cm in front — comfortable SO-101 reach from rest pose.
+#   Pen flat on desk (thin box, long axis +Y after 90° Z rot); holder ~8 cm away on the other side.
 
 objects:
   desk:
     shape: box
-    size: [0.5, 0.35, 0.02]
-    pos: [0.35, 0.0, 0.01]
+    size: [0.32, 0.28, 0.02]
+    pos: [0.20, 0.0, 0.01]
     fixed: true
     color: [0.45, 0.32, 0.18]
     surface: rough
+    friction: 2.0
+    contact_resistance: 5.0e3
 
-  pen_white:
-    shape: cylinder
-    radius: 0.007
-    height: 0.081
-    pos: [0.253, 0.08, 0.027]
-    euler: [0, 90, 0]
+  pen:
+    shape: box
+    size: [0.135, 0.018, 0.018]
+    pos: [0.17, 0.04, 0.029]
+    euler: [0, 0, 90]
     color: "#f4f4f4"
     surface: plastic
+    density: 400
+    friction: 2.5
+    coup_friction: 0.4
+    contact_resistance: 5.0e3
+    coup_restitution: 0.0
 
-  pen_cap:
-    shape: cylinder
-    radius: 0.007
-    height: 0.054
-    pos: [0.3205, 0.08, 0.027]
-    euler: [0, 90, 0]
-    color: "#141414"
-    surface: plastic
+  # Hollow cup holder (32 mm inner cavity — pen drops in vertically or at an angle).
+  # Walls + floor are colliders; liner is visual-only metal interior.
 
-  # Block outer shell (dark square cup body)
-  holder_shell:
+  holder_bottom:
     shape: box
-    size: [0.048, 0.048, 0.07]
-    pos: [0.42, -0.08, 0.055]
+    size: [0.032, 0.032, 0.003]
+    pos: [0.23, -0.04, 0.0215]
     fixed: true
     color: "#1a1a1a"
     surface: rough
+    friction: 2.0
 
-  # Metal-lined inner cup (cylinder visible at the opening)
-  holder_inner:
-    shape: cylinder
-    radius: 0.0155
-    height: 0.064
-    pos: [0.42, -0.08, 0.054]
+  holder_wall_xp:
+    shape: box
+    size: [0.006, 0.040, 0.055]
+    pos: [0.249, -0.04, 0.0505]
     fixed: true
+    color: "#1a1a1a"
+    surface: rough
+    friction: 2.0
+
+  holder_wall_xn:
+    shape: box
+    size: [0.006, 0.040, 0.055]
+    pos: [0.211, -0.04, 0.0505]
+    fixed: true
+    color: "#1a1a1a"
+    surface: rough
+    friction: 2.0
+
+  holder_wall_yp:
+    shape: box
+    size: [0.032, 0.006, 0.055]
+    pos: [0.23, -0.021, 0.0505]
+    fixed: true
+    color: "#1a1a1a"
+    surface: rough
+    friction: 2.0
+
+  holder_wall_yn:
+    shape: box
+    size: [0.032, 0.006, 0.055]
+    pos: [0.23, -0.059, 0.0505]
+    fixed: true
+    color: "#1a1a1a"
+    surface: rough
+    friction: 2.0
+
+  holder_liner:
+    shape: box
+    size: [0.030, 0.030, 0.048]
+    pos: [0.23, -0.04, 0.047]
+    fixed: true
+    collision: false
     color: [0.75, 0.77, 0.80]
     surface: aluminum
 
@@ -61,6 +96,8 @@ objects:
     pos: [0.30, -0.06, 0.05]
     color: "#e63946"
     surface: plastic
+    density: 700
+    friction: 1.5
     enabled: false
 
   green_sphere:
@@ -68,4 +105,6 @@ objects:
     radius: 0.02
     pos: [0.38, 0.10, 0.06]
     color: [0.2, 0.75, 0.3]
+    density: 700
+    friction: 1.5
     enabled: false

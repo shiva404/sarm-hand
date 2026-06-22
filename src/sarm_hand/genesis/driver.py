@@ -10,6 +10,7 @@ import numpy.typing as npt
 
 from ..config import JOINT_NAMES, ProjectConfig
 from .scene import SO101GenesisScene
+from .tensors import to_numpy
 from .units import radians_to_norm
 
 FloatArray = npt.NDArray[np.float32]
@@ -76,7 +77,7 @@ class SO101SceneDriver:
         if pixels is None:
             h, w, c = self.image_shape
             pixels = np.zeros((h, w, c), dtype=np.uint8)
-        qpos = self._scene.robot.get_dofs_position(self._scene.dof_indices)
+        qpos = to_numpy(self._scene.robot.get_dofs_position(self._scene.dof_indices))
         agent_pos = np.array(
             [
                 radians_to_norm(

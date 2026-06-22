@@ -61,36 +61,74 @@ tasks:
 
 # Genesis World physics sim — `uv sync --extra genesis` then ./scripts/fetch_so101_assets.sh
 genesis:
-  urdf: assets/robots/so101/so101_new_calib.urdf
+  urdf: assets/robots/so101/so101_old_calib.urdf
+  mapping: legacy             # delta = pure encoder mirror (cal-independent, deterministic)
   backend: auto              # auto | metal | cuda | cpu (auto → Metal on Apple Silicon)
-  # Rest pose from `sarm-hand test-motors` (Present_Position, torque off). Converted via calibration.
+  # Encoder anchor: leader Present_Position at the folded rest pose (torque off).
+  # Re-capture with: sarm-hand calibrate-genesis --capture-home --save-home
   home_raw:
-    shoulder_pan: 2357
-    shoulder_lift: 2146
-    elbow_flex: 2060
-    wrist_flex: 1912
-    wrist_roll: 1995
-    gripper: 2495
+    shoulder_pan: 2340
+    shoulder_lift: 2154
+    elbow_flex: 2059
+    wrist_flex: 1906
+    wrist_roll: 1951
+    gripper: 2043
+  # Sim URDF degrees (old_calib) when leader sits at home_raw. Verified against
+  # the physical folded rest photo; everything else tracks 1:1 from encoder delta.
+  rest_pose:
+    shoulder_pan: 0
+    shoulder_lift: -45
+    elbow_flex: 72
+    wrist_flex: 75
+    wrist_roll: 0
+    gripper: 42
   calibration_role: leader     # leader | follower — LeRobot cal file for norm↔URDF mapping
-  # Wide cal joints (0..4095): map norm linearly to new_calib URDF limits; home anchored via
-  # legacy limits + frame_offset so leader norm gain ≈ 1° per unit (not compressed ~50%).
   joints:
-    shoulder_pan:  { sign: -1 }
-    shoulder_lift: { sign:  1, frame_offset: -1.5708 }
-    elbow_flex:    { sign:  1, frame_offset: 1.5708 }
+    shoulder_pan:  { sign:  1 }
+    shoulder_lift: { sign:  1, mirror_raw_deadband: 4 }
+    elbow_flex:    { sign:  1 }
     wrist_flex:    { sign:  1 }
-    wrist_roll:    { sign: -1 }
-    gripper:       { sign:  1 }
+    wrist_roll:    { sign:  1 }
+    gripper:       { sign:  1, mirror_raw_deadband: 0 }
   dt: 0.01
+  substeps: 8                 # physics substeps per dt — higher = stabler contacts
+  gravity: [0, 0, -9.81]       # Earth gravity; pen mass/friction tuned for stable grasp
   scene: pick_place_desk
   headless: false
+  # Robot base orientation in the world (degrees, XYZ euler).
+  # [0,0,90] yaws the arm to face the desk (+X), where objects and cameras sit.
+  base_euler: [0, 0, 90]
+  # Leader → sim mirror: instant pose copy from leader; deadband filters encoder jitter.
+  mirror_kinematic: true
+  mirror_rate_hz: 30
+  mirror_substeps: 1
+  mirror_grasp_substeps: 2
+  mirror_grasp_carry: true
+  grasp_weld: false             # false = kinematic carry + desk clamp (works with teleport mirror)
+  grasp_close_deg: 48           # leader gripper ° to latch (above mapped rest ~46)
+  grasp_open_deg: 42            # leader gripper ° to release (below rest = clearly open)
+  grasp_radius_m: 0.14          # finger-to-prop surface distance for latch (m)
+  grasp_tight_radius_m: 0.08    # sim fingers nearly shut can latch within this gap
+  grasp_log: true                # write grasp_log.jsonl during record-sim --leader
+  grasp_link: jaw
+  grasp_anchor_links: [gripper, jaw]
+  gripper_sim_extra_close_deg: 34
+  gripper_sim_extra_from_deg: 44   # narrow sim gap as soon as gripper moves off rest
+  mirror_raw_deadband: 2
+  mirror_smoothing: 1.0
+  # Interactive 3D viewer (orbit/zoom) — forward view for leader teleop / pick-place.
+  viewer:
+    pos: [-0.42, 0.0, 0.48]
+    lookat: [0.20, 0.0, 0.06]
+    fov: 58
   cameras:
     front:
       width: 640
       height: 480
-      pos: [0.35, -0.55, 0.35]
-      lookat: [0.35, 0.0, 0.12]
-      fov: 55
+      # Recording camera — side view, zoomed out, flat (unchanged).
+      pos: [0.32, -0.88, 0.42]
+      lookat: [0.32, 0.0, 0.10]
+      fov: 38
     top:
       width: 640
       height: 480

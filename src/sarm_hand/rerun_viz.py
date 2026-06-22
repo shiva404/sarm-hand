@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numbers
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
@@ -175,6 +175,7 @@ def leader_teleop_loop(
     display_data: bool = False,
     duration: float | None = None,
     display_compressed_images: bool = False,
+    remap_action: Callable[[dict[str, float]], dict[str, float]] | None = None,
 ) -> None:
     """Leader-follower loop with Rerun motor time series."""
     from lerobot.utils.robot_utils import precise_sleep
@@ -192,6 +193,8 @@ def leader_teleop_loop(
 
         raw_action = teleop.get_action()
         teleop_action = teleop_action_processor((raw_action, obs))
+        if remap_action is not None:
+            teleop_action = remap_action(teleop_action)
         robot_action_to_send = robot_action_processor((teleop_action, obs))
         _ = robot.send_action(robot_action_to_send)
 

@@ -8,6 +8,7 @@ import numpy as np
 
 from ..config import JOINT_NAMES, ProjectConfig
 from ..genesis.scene import SO101GenesisScene
+from ..genesis.tensors import to_numpy
 from ..genesis.units import norm_to_radians, radians_to_observation
 from .base import RobotBackend
 
@@ -59,7 +60,7 @@ class GenesisSimRobot(RobotBackend):
         if self._scene is None:
             raise RuntimeError("Genesis sim not connected")
         self._scene.step(1)
-        qpos = self._scene.robot.get_dofs_position(self._scene.dof_indices)
+        qpos = to_numpy(self._scene.robot.get_dofs_position(self._scene.dof_indices))
         obs = radians_to_observation(
             list(qpos),
             self._cfg,

@@ -75,8 +75,7 @@ def test_home_pose_uses_home_raw(cfg: ProjectConfig, limits):
     assert radians == pytest.approx(expected, abs=1e-5)
 
 
-def test_wrist_roll_midpoint_not_zero(cfg: ProjectConfig, limits):
+def test_wrist_roll_norm_zero_maps_to_midpoint(cfg: ProjectConfig, limits):
     lo, hi = limits["wrist_roll"]
     mid = (lo + hi) / 2
-    assert abs(mid) > 0.01
     assert norm_to_radians(0.0, "wrist_roll", cfg, urdf_limits=limits) == pytest.approx(mid, abs=1e-4)

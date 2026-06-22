@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .calibration_bridge import (
+    calibration_mismatch_report,
+    leader_pose_to_follower_action,
+    remap_leader_action_to_follower,
+    require_teleop_calibrations,
+)
 from .config import JOINT_NAMES, ProjectConfig
 from .robot import (
     _motor_write_retries,
@@ -28,6 +34,7 @@ _DEMO_PREFIX = "demo_"
 class TaskMotionFrame:
     t: float
     joints: dict[str, float]
+    raw: dict[str, int] | None = None
 
 
 @dataclass
@@ -65,6 +72,7 @@ class TaskMotionDemo:
             TaskMotionFrame(
                 t=float(item["t"]),
                 joints={k: float(v) for k, v in item["joints"].items()},
+                raw={k: int(v) for k, v in item["raw"].items()} if item.get("raw") else None,
             )
             for item in raw.get("frames", [])
         ]
@@ -239,11 +247,20 @@ def record_task_motion(
     from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
     from lerobot.utils.robot_utils import precise_sleep
 
+    from .joint_signal_log import _read_all_raw
+
     cfg = ProjectConfig.load()
     slug = task_slug_from_task(task)
     resolved_fps = fps if fps is not None else cfg.tasks.fps
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
     leader_port = ensure_port(leader_port or cfg.teleop.leader.port, "Leader")
+    leader_cal, follower_cal = require_teleop_calibrations(cfg)
+    mismatch = calibration_mismatch_report(leader_cal, follower_cal)
+    if mismatch and mirror_follower:
+        print("Calibration mismatch (remapping via encoder counts):")
+        for line in mismatch:
+            print(f"  - {line}")
+        print("  Fix permanently:  sarm-hand sync-calibration --from leader --write-motors\n")
 
     require_all_motors("leader", leader_port, context="task record")
     if mirror_follower:
@@ -298,11 +315,18 @@ def record_task_motion(
             raw_action = leader.get_action()
             teleop_action = teleop_action_processor((raw_action, {}))
             joints = _joints_from_action(teleop_action)
-            frames.append(TaskMotionFrame(t=loop_start - start, joints=joints))
+            raw_counts = _read_all_raw(leader.bus)
+            frames.append(TaskMotionFrame(t=loop_start - start, joints=joints, raw=raw_counts))
 
             if robot is not None:
                 obs = robot.get_observation()
-                sent = robot_action_processor((teleop_action, obs))
+                follower_action = leader_pose_to_follower_action(
+                    joints=joints,
+                    raw=raw_counts,
+                    leader_cal=leader_cal,
+                    follower_cal=follower_cal,
+                )
+                sent = robot_action_processor((follower_action, obs))
                 robot.send_action(sent)
 
             if len(frames) == 1 or len(frames) % resolved_fps == 0:
@@ -363,6 +387,17 @@ def replay_task_motion(
     demo = load_demo(path)
     port = ensure_port(follower_port or cfg.robot.port, "Follower")
     require_all_motors("follower", port, context="task replay")
+    leader_cal, follower_cal = require_teleop_calibrations(cfg)
+    mismatch = calibration_mismatch_report(leader_cal, follower_cal)
+    has_raw = any(frame.raw for frame in demo.frames)
+    if mismatch and not has_raw:
+        print("Calibration mismatch — replay remaps leader norms via encoder counts:")
+        for line in mismatch:
+            print(f"  - {line}")
+        print("  Fix permanently:  sarm-hand sync-calibration --from leader --write-motors")
+        print("  Re-record demos to also save leader raw counts for exact replay.\n")
+    elif mismatch and has_raw:
+        print("Replay uses saved leader encoder counts (calibration-independent).\n")
 
     print("Task motion replay")
     print(f"  Task:     {demo.task}")
@@ -392,7 +427,12 @@ def replay_task_motion(
                 print(f"\n--- Loop {run} ---")
             for index, frame in enumerate(demo.frames):
                 loop_start = time.perf_counter()
-                action = _action_from_joints(frame.joints)
+                action = leader_pose_to_follower_action(
+                    joints=frame.joints,
+                    raw=frame.raw,
+                    leader_cal=leader_cal,
+                    follower_cal=follower_cal,
+                )
                 robot.send_action(action)
                 if index == 0 or (index + 1) % demo.fps == 0:
                     print(f"  frame {index + 1}/{len(demo.frames)}")

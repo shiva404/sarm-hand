@@ -28,6 +28,12 @@ class SceneObjectSpec:
     height: float | None = None
     density: float | None = None
     euler: tuple[float, float, float] | None = None  # degrees — rotate cylinder/box (e.g. lay pen flat)
+    friction: float | None = None  # contact friction; higher = grips desk, less sliding/launching
+    contact_resistance: float | None = None  # stiffer contacts — less interpenetration
+    coup_restitution: float | None = None  # 0 = no bounce on impact
+    coup_friction: float | None = None  # surface coupling friction (higher = less slip)
+    collision: bool = True  # false = visual only (no physics collider)
+    attach_to: str | None = None  # weld this object onto another (e.g. cap onto pen barrel)
 
     @property
     def initial_pos(self) -> np.ndarray:
@@ -105,6 +111,12 @@ def _parse_object(name: str, raw: dict[str, Any]) -> SceneObjectSpec:
         height=float(raw["height"]) if "height" in raw else None,
         density=float(raw["density"]) if "density" in raw else None,
         euler=_vec3(raw.get("euler"), (0.0, 0.0, 0.0)) if raw.get("euler") is not None else None,
+        friction=float(raw["friction"]) if "friction" in raw else None,
+        contact_resistance=float(raw["contact_resistance"]) if "contact_resistance" in raw else None,
+        coup_restitution=float(raw["coup_restitution"]) if "coup_restitution" in raw else None,
+        coup_friction=float(raw["coup_friction"]) if "coup_friction" in raw else None,
+        collision=bool(raw.get("collision", True)),
+        attach_to=str(raw["attach_to"]) if raw.get("attach_to") else None,
     )
 
 
@@ -168,7 +180,7 @@ def build_surface(gs, spec: SceneObjectSpec):
 
 def build_morph(gs, spec: SceneObjectSpec):
     """Create a Genesis morph from object spec."""
-    kwargs: dict[str, Any] = {"pos": spec.pos, "fixed": spec.fixed}
+    kwargs: dict[str, Any] = {"pos": spec.pos, "fixed": spec.fixed, "collision": spec.collision}
     if spec.euler is not None:
         kwargs["euler"] = spec.euler
     if spec.shape == "box":
@@ -186,15 +198,56 @@ def build_morph(gs, spec: SceneObjectSpec):
     raise ValueError(f"Object {spec.name!r}: unsupported shape {spec.shape!r} (use box, cylinder, sphere)")
 
 
+def _build_material(gs, spec: SceneObjectSpec):
+    kwargs: dict[str, Any] = {}
+    if spec.density:
+        kwargs["rho"] = spec.density
+    if spec.friction is not None:
+        kwargs["friction"] = spec.friction
+    if spec.contact_resistance is not None:
+        kwargs["contact_resistance"] = spec.contact_resistance
+    if spec.coup_restitution is not None:
+        kwargs["coup_restitution"] = spec.coup_restitution
+    if spec.coup_friction is not None:
+        kwargs["coup_friction"] = spec.coup_friction
+    return gs.materials.Rigid(**kwargs)
+
+
+def spawn_quat_wxyz(spec: SceneObjectSpec) -> np.ndarray | None:
+    """Spawn orientation from extrinsic XYZ euler (degrees) → quaternion [w,x,y,z]."""
+    if spec.euler is None:
+        return None
+    ax, ay, az = np.deg2rad(spec.euler)
+    cx, sx = np.cos(ax / 2), np.sin(ax / 2)
+    cy, sy = np.cos(ay / 2), np.sin(ay / 2)
+    cz, sz = np.cos(az / 2), np.sin(az / 2)
+    w = cx * cy * cz + sx * sy * sz
+    x = sx * cy * cz - cx * sy * sz
+    y = cx * sy * cz + sx * cy * sz
+    z = cx * cy * sz - sx * sy * cz
+    return np.array([w, x, y, z], dtype=np.float64)
+
+
 def spawn_scene_objects(scene, gs, definition: SceneDefinition) -> dict[str, SceneProp]:
-    """Add all enabled objects from a scene definition."""
+    """Add all enabled objects, then weld any ``attach_to`` children (before build)."""
     props: dict[str, SceneProp] = {}
     for spec in definition.objects:
         if not spec.enabled:
             continue
         morph = build_morph(gs, spec)
         surface = build_surface(gs, spec)
-        material = gs.materials.Rigid(rho=spec.density) if spec.density else gs.materials.Rigid()
+        material = _build_material(gs, spec)
         entity = scene.add_entity(morph, material=material, surface=surface, name=spec.name)
         props[spec.name] = SceneProp(spec=spec, entity=entity)
+
+    # Weld children onto parents so they move as one rigid body (e.g. pen cap onto barrel).
+    # Must run before scene.build(); attach() modifies the kinematic tree.
+    for spec in definition.objects:
+        if not spec.enabled or not spec.attach_to:
+            continue
+        parent = props.get(spec.attach_to)
+        child = props.get(spec.name)
+        if parent is None:
+            raise ValueError(f"Object {spec.name!r}: attach_to {spec.attach_to!r} not found in scene")
+        child.entity.attach(parent.entity, parent.entity.links[-1].name)
     return props

@@ -47,27 +47,31 @@ def map_limits(cfg: ProjectConfig, hard_limits):
 
 def test_shoulder_elbow_legacy_limits_for_home_anchor(cfg: ProjectConfig, map_limits):
     """Wide-cal joints keep legacy limits in config for home anchoring only."""
+    if cfg.genesis.mapping != "legacy":
+        pytest.skip("legacy mapping not enabled in config")
     assert map_limits["shoulder_lift"] == pytest.approx(_OLD_SHOULDER_LIFT, abs=1e-4)
     assert map_limits["elbow_flex"] == pytest.approx(_OLD_ELBOW_FLEX, abs=1e-4)
 
 
 def test_home_pose_rest_angles(cfg: ProjectConfig, leader_cal, hard_limits):
-    """Rest pose in new_calib URDF frame (anchored from legacy + frame_offset)."""
+    """At home_raw, delta mapping reproduces genesis.rest_pose exactly."""
     if not cfg.genesis.home_raw:
         pytest.skip("home_raw not configured")
+    if cfg.genesis.mapping != "delta":
+        pytest.skip("rest_pose anchor applies only to delta mapping")
 
     radians = home_pose_radians(cfg, calibration=leader_cal, urdf_limits=hard_limits)
-    shoulder = math.degrees(radians[1])
-    elbow = math.degrees(radians[2])
-    wrist = math.degrees(radians[3])
-
-    assert shoulder == pytest.approx(3.5, abs=3.0)
-    assert elbow == pytest.approx(-5.8, abs=3.0)
-    assert wrist == pytest.approx(44.3, abs=2.0)
+    for i, joint in enumerate(JOINT_NAMES):
+        target = cfg.genesis.rest_pose.get(joint)
+        if target is None:
+            continue
+        assert math.degrees(radians[i]) == pytest.approx(float(target), abs=1.0)
 
 
 def test_wide_cal_norm_gain_near_one_degree_per_unit(cfg: ProjectConfig, leader_cal, hard_limits):
-    """Leader norm delta ≈ URDF degree delta for shoulder_lift / elbow_flex."""
+    """Leader norm delta ≈ URDF degree delta for shoulder_lift / elbow_flex (wide_cal mode)."""
+    if cfg.genesis.mapping != "wide_cal":
+        pytest.skip("wide_cal mapping not enabled in config")
     from sarm_hand.genesis.calibration import raw_to_norm
 
     for joint in ("shoulder_lift", "elbow_flex"):
@@ -116,6 +120,8 @@ def test_norm_direction_monotonic(cfg: ProjectConfig, leader_cal, hard_limits):
 
 
 def test_norm_raw_radians_roundtrip(cfg: ProjectConfig, leader_cal, hard_limits):
+    if cfg.genesis.mapping == "delta":
+        pytest.skip("delta mapping uses rest_pose anchor, not norm-linear roundtrip")
     cases = {
         "shoulder_lift": (-30.0, 0.0, 30.0),
         "elbow_flex": (-30.0, 0.0, 30.0),

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import DEFAULT_CONFIG_PATH, JOINT_NAMES, ProjectConfig
-from ..genesis.calibration import raw_to_norm, require_calibration
+from ..genesis.calibration import require_calibration
 from ..genesis.deps import ensure_genesis
 from ..genesis.shutdown import (
     check_shutdown,
@@ -20,7 +20,8 @@ from ..genesis.shutdown import (
     interruptible_sleep,
     shutdown_requested,
 )
-from ..genesis.units import norm_to_radians
+from ..genesis.tensors import to_numpy
+from ..genesis.units import raw_to_radians
 from ..genesis.urdf_limits import urdf_joint_limits
 from ..joint_signal_log import (
     _read_all_raw,
@@ -29,6 +30,8 @@ from ..joint_signal_log import (
     print_signal_analysis,
 )
 from ..robot import _make_setup_device, disable_arm_torque, ensure_port, resolve_role_port
+from .leader import so101_leader_config, sync_leader_to_scene
+from .home_pose import format_home_pose_summary
 
 
 @dataclass
@@ -95,18 +98,12 @@ def _mapped_deg_from_raw(
     calibration: dict[str, dict[str, Any]],
 ) -> float:
     hard = urdf_joint_limits(cfg)
-    rad = norm_to_radians(
-        raw_to_norm(raw, joint, calibration),
-        joint,
-        cfg,
-        calibration=calibration,
-        urdf_limits=hard,
-    )
+    rad = raw_to_radians(int(raw), joint, cfg, calibration, hard_limits=hard)
     return math.degrees(rad)
 
 
 def _read_sim_deg(scene) -> dict[str, float]:
-    qpos = scene.robot.get_dofs_position(scene.dof_indices)
+    qpos = to_numpy(scene.robot.get_dofs_position(scene.dof_indices))
     return {name: math.degrees(float(qpos[i])) for i, name in enumerate(JOINT_NAMES)}
 
 
@@ -258,19 +255,48 @@ def _cell(row: LeaderSimRow, col: int, show_deltas: bool) -> int:
     return len(vals[col])
 
 
-def _print_angle_legend() -> None:
+def _print_angle_legend(cfg: ProjectConfig | None = None) -> None:
+    mode = (cfg.genesis.mapping if cfg else "delta").lower()
     print(
-        "  enc°  = (raw − home_raw) × 360/4096 — pulse direction, no sign flip\n"
-        "  map°  = leader raw → URDF ° via calibration mapping (sent to sim)\n"
+        "  enc°  = (raw − home_raw) × 360/4096 — pulse travel from anchor, no sign\n"
+        "  map°  = leader raw → URDF ° (sent to sim)\n"
         "  sim°  = Genesis joint qpos °\n"
         "  m−s   = map − sim (sim tracking; should ≈ 0)\n"
-        "  e−s   = enc − sim (leader vs sim; constant offset ⇒ add frame_offset)\n"
     )
+    if mode == "delta":
+        print(
+            "  Delta mapping: at rest sim° == genesis.rest_pose; any move tracks\n"
+            "  encoder 1:1 (Δenc° == Δsim°). If a joint moves the wrong way,\n"
+            "  flip its genesis.joints.<joint>.sign in config/default.yaml.\n"
+        )
+    else:
+        print("  e−s   = enc − sim (leader vs sim; constant offset ⇒ add frame_offset)\n")
 
 
-def _print_rest_alignment(rows: list[LeaderSimRow]) -> None:
-    print("=== Rest alignment (move leader to rest before starting) ===\n")
+def _print_rest_alignment(rows: list[LeaderSimRow], cfg: ProjectConfig | None = None) -> None:
+    mode = (cfg.genesis.mapping if cfg else "delta").lower()
+    print("=== Rest alignment (put leader in its folded rest pose) ===\n")
     print(format_leader_sim_table(rows, show_deltas=False))
+
+    if mode == "delta" and cfg is not None:
+        warns: list[str] = []
+        for r in rows:
+            target = cfg.genesis.rest_pose.get(r.joint)
+            if target is None:
+                continue
+            if abs(r.sim_deg - float(target)) >= 5.0:
+                warns.append(
+                    f"  {r.joint}: sim°={r.sim_deg:+.1f} but rest_pose={float(target):+.1f} "
+                    f"(enc°={r.enc_deg:+.1f}) — re-capture anchor with --capture-home --save-home"
+                )
+        if warns:
+            print("\nLeader is not at the captured rest anchor:")
+            print("\n".join(warns))
+        else:
+            print("\n✓ Leader at rest anchor — sim matches genesis.rest_pose.")
+        print()
+        return
+
     hints: list[str] = []
     for r in rows:
         if abs(r.align_deg) >= 15.0:
@@ -326,13 +352,13 @@ def _interactive_measure_joints(
     print("\n=== Per-joint travel measure ===")
     print("For each joint: rest → move ~90° on the leader → press Enter.\n")
     baseline_raw = _read_all_raw(bus)
-    scene.sync_norm_pose(leader.get_action())
+    sync_leader_to_scene(scene, leader)
     scene.refresh_previews()
 
     for joint in JOINT_NAMES:
         input(f"  [{joint}] at rest — press Enter to capture baseline...")
         baseline_raw = _read_all_raw(bus)
-        scene.sync_norm_pose(leader.get_action())
+        sync_leader_to_scene(scene, leader)
         scene.refresh_previews()
         baseline_sim_at_rest = _read_sim_deg(scene)
         b_enc, b_map, b_sim = _deg_baselines(
@@ -340,8 +366,7 @@ def _interactive_measure_joints(
         )
         input(f"  [{joint}] move ~90° then press Enter...")
         raw = _read_all_raw(bus)
-        action = leader.get_action()
-        scene.sync_norm_pose(action)
+        action = sync_leader_to_scene(scene, leader)
         scene.refresh_previews()
         sim_deg = _read_sim_deg(scene)
         rows = build_leader_sim_rows(
@@ -367,7 +392,7 @@ def _interactive_measure_joints(
 def run_genesis_leader_calib(
     *,
     leader_port: str | None = None,
-    rate_hz: float = 15.0,
+    rate_hz: float | None = None,
     duration_s: float | None = None,
     capture_home: bool = False,
     save_home: bool = False,
@@ -393,11 +418,10 @@ def run_genesis_leader_calib(
         print("Starting live leader ↔ Genesis calibration (torque off).\n")
 
     from lerobot.teleoperators.so_leader import SO101Leader
-    from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
 
     from .scene import SO101GenesisScene
 
-    leader_cfg = SO101LeaderConfig(id=cfg.teleop.leader.id, port=port)
+    leader_cfg = so101_leader_config(cfg, port)
     leader = SO101Leader(leader_cfg)
     device = _make_setup_device("leader", port)
     bus = device.bus
@@ -418,12 +442,14 @@ def run_genesis_leader_calib(
         leader.disconnect()
         return
 
-    scene = SO101GenesisScene.create(cfg, calibration_role=cal_role)
+    scene = SO101GenesisScene.create(cfg, calibration_role=cal_role, apply_home=False)
     ensure_shutdown_handlers()
 
     home_raw = _read_all_raw(bus)
-    scene.sync_norm_pose(leader.get_action())
+    rest_action = sync_leader_to_scene(scene, leader)
     scene.refresh_previews()
+    print(format_home_pose_summary(cfg, calibration=cal))
+    print()
 
     baseline_raw = dict(home_raw)
     baseline_sim = _read_sim_deg(scene)
@@ -432,12 +458,12 @@ def run_genesis_leader_calib(
     )
     rest_rows = build_leader_sim_rows(
         raw=baseline_raw,
-        action=leader.get_action(),
+        action=rest_action,
         sim_deg=baseline_sim,
         cfg=cfg,
         calibration=cal,
     )
-    interval = 1.0 / rate_hz
+    interval = 1.0 / (rate_hz if rate_hz is not None else cfg.genesis.mirror_rate_hz)
     deadline = time.perf_counter() + duration_s if duration_s else None
     steps = 0
     interrupted = False
@@ -446,10 +472,11 @@ def run_genesis_leader_calib(
     print("Genesis leader calibration")
     print(f"  Leader:  {port}")
     print(f"  Scene:   {cfg.genesis.scene}")
-    print(f"  Rate:    {rate_hz} Hz")
+    hz = rate_hz if rate_hz is not None else cfg.genesis.mirror_rate_hz
+    print(f"  Rate:    {hz} Hz")
     print("  Move the leader — sim should track. Ctrl+C to stop.\n")
-    _print_angle_legend()
-    _print_rest_alignment(rest_rows)
+    _print_angle_legend(cfg)
+    _print_rest_alignment(rest_rows, cfg)
 
     if measure_joints:
         try:
@@ -469,9 +496,7 @@ def run_genesis_leader_calib(
             check_shutdown()
             loop_start = time.perf_counter()
             raw = _read_all_raw(bus)
-            action = leader.get_action()
-            scene.sync_norm_pose(action)
-            scene.refresh_previews()
+            action = sync_leader_to_scene(scene, leader)
             sim_deg = _read_sim_deg(scene)
             rows = build_leader_sim_rows(
                 raw=raw,
@@ -493,7 +518,7 @@ def run_genesis_leader_calib(
                         if abs(r.enc_deg_delta) > abs(prev.enc_deg_delta):
                             max_rows[i] = r
 
-            if steps == 0 or steps % int(rate_hz * 2) == 0:
+            if steps == 0 or steps % int(hz * 2) == 0:
                 print(format_leader_sim_table(rows, show_deltas=True))
                 print()
             steps += 1

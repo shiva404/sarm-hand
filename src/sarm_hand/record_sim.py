@@ -182,53 +182,59 @@ def _record_genesis_leader_episodes(
     episode_time_s: float,
     reset_time_s: float,
     fps: int,
+    grasp_log_path: Path | None = None,
 ) -> int:
     """Record Genesis sim episodes driven by a USB leader arm."""
-    from lerobot.processor import make_default_processors
     from lerobot.teleoperators.so_leader import SO101Leader
-    from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
 
+    from .genesis.grasp_diag import GraspLogWriter
+    from .genesis.leader import so101_leader_config, sync_leader_to_scene
+    from .genesis.scene import SO101GenesisScene
     from .robot import _motor_write_retries, disable_arm_torque, ensure_port, require_all_motors
 
     port = ensure_port(leader_port, "Leader")
     require_all_motors("leader", port, context="record-sim")
     disable_arm_torque("leader", port)
 
-    leader_cfg = SO101LeaderConfig(
-        id=cfg.teleop.leader.id,
-        port=port,
-        use_degrees=cfg.robot.use_degrees,
-    )
+    leader_cfg = so101_leader_config(cfg, port)
     leader = SO101Leader(leader_cfg)
-    teleop_action_processor, _, _ = make_default_processors()
     install_shutdown_handlers()
-    scene = SO101GenesisScene.create(cfg, calibration_role="leader")
+    cal_role = cfg.genesis.calibration_role or "leader"
+    scene = SO101GenesisScene.create(cfg, calibration_role=cal_role, apply_home=False)
     ensure_shutdown_handlers()
     interval = 1.0 / fps
     frames = 0
     interrupted = False
+    grasp_log: GraspLogWriter | None = None
+    if grasp_log_path is not None:
+        grasp_log = GraspLogWriter(grasp_log_path)
+        print(f"  Grasp log: {grasp_log_path}")
 
     try:
         with _motor_write_retries():
             leader.connect()
-        scene.sync_norm_pose(leader.get_action())
+        sync_leader_to_scene(scene, leader)
         for ep in range(n_episodes):
             check_shutdown()
             print(f"Episode {ep + 1}/{n_episodes} — move the leader arm (Ctrl+C to stop early)")
             scene.reset_props()
-            scene.sync_norm_pose(leader.get_action())
+            sync_leader_to_scene(scene, leader)
             deadline = time.perf_counter() + episode_time_s
             while time.perf_counter() < deadline:
                 check_shutdown()
                 loop_start = time.perf_counter()
-                raw_action = leader.get_action()
-                teleop_action = teleop_action_processor((raw_action, {}))
-                scene.set_joint_positions_norm(teleop_action)
-                scene.step(1)
+                action = sync_leader_to_scene(scene, leader)
+                if grasp_log is not None and scene._last_grasp_diag is not None:
+                    grasp_log.write(
+                        scene._last_grasp_diag,
+                        episode=ep + 1,
+                        frame=frames,
+                    )
+                    grasp_log.maybe_print_transition(scene._last_grasp_diag)
                 qpos = scene.robot.get_dofs_position(scene.dof_indices)
                 state = agent_pos_from_qpos(qpos, cfg, calibration=scene.calibration)
-                action = np.asarray(action_dict_to_vector(teleop_action), dtype=np.float32)
-                frame: dict = {"observation.state": state, "action": action}
+                action_vec = np.asarray(action_dict_to_vector(action), dtype=np.float32)
+                frame: dict = {"observation.state": state, "action": action_vec}
                 for name, rgb in scene.render_all_rgb().items():
                     frame[f"observation.images.{name}"] = rgb
                 sink.add_frame(frame)
@@ -243,6 +249,8 @@ def _record_genesis_leader_episodes(
         interrupted = True
         print("\nStopped early.")
     finally:
+        if grasp_log is not None:
+            grasp_log.close()
         scene.close()
         try:
             sink.finalize()
@@ -266,6 +274,7 @@ def record_sim(
     leader_port: str | None = None,
     resume: bool = False,
     timestamp: bool = True,
+    grasp_log: bool | None = None,
 ) -> None:
     """Record episodes in Genesis with all configured camera streams."""
     if random_actions and leader_port:
@@ -325,6 +334,10 @@ def record_sim(
         from .robot import ensure_port
 
         print(f"  Leader:    {ensure_port(leader_port, 'Leader')}")
+    log_grasp = cfg.genesis.grasp_log if grasp_log is None else grasp_log
+    grasp_log_path: Path | None = None
+    if leader_port and log_grasp:
+        grasp_log_path = dataset_path / "grasp_log.jsonl"
     if not cfg.genesis.headless:
         print("  Preview:   OpenCV windows sarm-hand: front | top | arm")
     print()
@@ -338,6 +351,7 @@ def record_sim(
             episode_time_s=resolved_time,
             reset_time_s=reset_time,
             fps=fps,
+            grasp_log_path=grasp_log_path,
         )
     else:
         from lerobot_genesis import GenesisEnv

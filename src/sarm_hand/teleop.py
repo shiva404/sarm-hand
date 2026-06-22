@@ -6,6 +6,11 @@ import subprocess
 import sys
 import webbrowser
 
+from .calibration_bridge import (
+    calibration_mismatch_report,
+    remap_leader_action_to_follower,
+    require_teleop_calibrations,
+)
 from .cameras import build_robot_camera_configs
 from .config import ProjectConfig
 from .rerun_viz import init_leader_teleop_rerun, leader_teleop_loop
@@ -35,6 +40,20 @@ def teleop_leader(
     cfg = ProjectConfig.load()
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
     leader_port = ensure_port(leader_port or cfg.teleop.leader.port, "Leader")
+    leader_cal, follower_cal = require_teleop_calibrations(cfg)
+    mismatch = calibration_mismatch_report(leader_cal, follower_cal)
+    if mismatch:
+        print("Calibration mismatch (teleop remaps via encoder counts):")
+        for line in mismatch:
+            print(f"  - {line}")
+        print("  Fix permanently:  sarm-hand sync-calibration --from leader --write-motors\n")
+
+    def _remap(action: dict[str, float]) -> dict[str, float]:
+        return remap_leader_action_to_follower(
+            action,
+            leader_cal=leader_cal,
+            follower_cal=follower_cal,
+        )
 
     require_all_motors("leader", leader_port, context="teleoperate")
     require_all_motors("follower", follower_port, context="teleoperate")
@@ -90,6 +109,7 @@ def teleop_leader(
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
+            remap_action=_remap,
         )
     except ConnectionError as exc:
         print(

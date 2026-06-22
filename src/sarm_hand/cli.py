@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .calibration_bridge import run_sync_calibration
 from .cameras import describe_camera, list_usb_cameras, preview_camera, test_configured_cameras
 from .config import JOINT_NAMES, ProjectConfig, parse_initial_ids
 from .data import dataset_export_episode, dataset_info, dataset_push, dataset_sample
@@ -107,6 +108,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="USB port (default: robot.port or teleop.leader.port from config/default.yaml)",
     )
     p.add_argument("--robot-id", default=None)
+
+    p = sub.add_parser(
+        "sync-calibration",
+        help="Merge leader travel ranges into follower cal (keeps each arm's homing offsets)",
+    )
+    p.add_argument(
+        "--from",
+        dest="from_role",
+        choices=["leader", "follower"],
+        default="leader",
+        help="Source calibration file (default: leader)",
+    )
+    p.add_argument(
+        "--to",
+        dest="to_role",
+        choices=["leader", "follower"],
+        default="follower",
+        help="Target calibration file (default: follower)",
+    )
+    p.add_argument(
+        "--port",
+        default=None,
+        help="USB port for --write-motors (default: target role port from config)",
+    )
+    p.add_argument(
+        "--write-motors",
+        action="store_true",
+        help="Flash travel ranges to target arm servos (preserves homing offsets on EEPROM)",
+    )
 
     p = sub.add_parser("test-motors", help="Ping/read/torque test each servo individually")
     p.add_argument("--role", choices=["follower", "leader"], required=True)
@@ -350,6 +380,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Use fixed repo id without timestamp (fails if dataset exists)",
     )
 
+    p.add_argument(
+        "--no-grasp-log",
+        action="store_true",
+        help="Disable grasp_log.jsonl during leader recording",
+    )
+
     p = sub.add_parser(
         "log-joint-signal",
         help="Log encoder pulses vs LeRobot norm vs Genesis sim angles (90° travel gap)",
@@ -381,7 +417,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mirror leader into Genesis; compare pulses, norm, and sim angles",
     )
     p.add_argument("--leader-port", default=None, help="Leader USB port (overrides config)")
-    p.add_argument("--rate", type=float, default=15.0, help="Live update rate (Hz)")
+    p.add_argument("--rate", type=float, default=None, help="Live update rate Hz (default: genesis.mirror_rate_hz)")
     p.add_argument("--duration", type=float, default=None, help="Stop after N seconds (default: until Ctrl+C)")
     p.add_argument(
         "--capture-home",
@@ -493,6 +529,13 @@ def main() -> None:
             )
         case "calibrate":
             calibrate(args.role, resolve_role_port(args.role, args.port), args.robot_id)
+        case "sync-calibration":
+            run_sync_calibration(
+                from_role=args.from_role,
+                to_role=args.to_role,
+                port=args.port,
+                write_motors=args.write_motors,
+            )
         case "test-motors":
             test_motors(args.role, resolve_role_port(args.role, args.port), retries=args.retries)
         case "leader-free":
@@ -656,6 +699,7 @@ def main() -> None:
                 leader_port=leader_port,
                 resume=args.resume,
                 timestamp=not args.no_timestamp,
+                grasp_log=False if args.no_grasp_log else None,
             )
         case "log-joint-signal":
             run_joint_signal_log(

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from sarm_hand.config import GenesisSettings
-from sarm_hand.genesis.scene_loader import _parse_color, _parse_object, load_scene_definition
+from sarm_hand.genesis.scene_loader import _parse_color, _parse_object, load_scene_definition, spawn_quat_wxyz
 
 
 def test_parse_hex_color():
@@ -31,28 +32,47 @@ def test_load_pick_place_scene():
     definition = load_scene_definition(GenesisSettings(scene="pick_place_desk"))
     names = {obj.name for obj in definition.objects}
     assert "desk" in names
-    assert "pen_white" in names
-    assert "pen_cap" in names
-    assert "pen_black" not in names
-    assert "holder_shell" in names
-    assert "holder_inner" in names
+    assert "pen" in names
+    assert "pen_white" not in names
+    assert "pen_cap" not in names
+    assert "holder_bottom" in names
+    assert "holder_wall_xp" in names
+    assert "holder_liner" in names
+    assert "holder_shell" not in names
+    assert "holder_inner" not in names
     assert "red_cube" not in names  # enabled: false
 
-    white = next(obj for obj in definition.objects if obj.name == "pen_white")
-    assert white.euler == (0.0, 90.0, 0.0)
-    assert white.height == pytest.approx(0.081)
-    assert white.color == (0xF4 / 255, 0xF4 / 255, 0xF4 / 255)
+    pen = next(obj for obj in definition.objects if obj.name == "pen")
+    assert pen.shape == "box"
+    assert pen.size == pytest.approx((0.135, 0.018, 0.018))
+    assert pen.friction == pytest.approx(2.5)
+    assert pen.coup_friction == pytest.approx(0.4)
+    assert pen.euler == (0.0, 0.0, 90.0)
+    assert pen.density == pytest.approx(400)
+    assert pen.contact_resistance == pytest.approx(5.0e3)
+    assert pen.coup_restitution == pytest.approx(0.0)
+    assert pen.color == (0xF4 / 255, 0xF4 / 255, 0xF4 / 255)
 
-    cap = next(obj for obj in definition.objects if obj.name == "pen_cap")
-    assert cap.height == pytest.approx(0.054)
-    assert cap.color == (0x14 / 255, 0x14 / 255, 0x14 / 255)
-
-    inner = next(obj for obj in definition.objects if obj.name == "holder_inner")
-    assert inner.shape == "cylinder"
-    assert inner.surface == "aluminum"
+    liner = next(obj for obj in definition.objects if obj.name == "holder_liner")
+    assert liner.collision is False
+    assert liner.surface == "aluminum"
 
 
-def test_parse_sphere_object():
+def test_spawn_quat_z90():
+    from sarm_hand.genesis.scene_loader import SceneObjectSpec
+
+    q = spawn_quat_wxyz(SceneObjectSpec("pen", "box", (0, 0, 0), euler=(0, 0, 90)))
+    assert q is not None
+    np.testing.assert_allclose(q, [0.70710678, 0, 0, 0.70710678], atol=1e-6)
+
+
+def test_parse_collision_flag():
+    spec = _parse_object(
+        "liner",
+        {"shape": "box", "size": [0.03, 0.03, 0.05], "pos": [0, 0, 0], "collision": False},
+    )
+    assert spec.collision is False
+
     spec = _parse_object("ball", {"shape": "sphere", "radius": 0.02, "pos": [0, 0, 1], "color": [1, 0, 0]})
     assert spec.shape == "sphere"
     assert spec.radius == 0.02

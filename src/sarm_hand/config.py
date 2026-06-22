@@ -119,6 +119,15 @@ class RobotSettings:
 
 
 @dataclass
+class GenesisViewerSettings:
+    """Interactive Genesis 3D viewer (orbit / zoom) — separate from recording cameras."""
+
+    pos: list[float] | None = None
+    lookat: list[float] | None = None
+    fov: float | None = None
+
+
+@dataclass
 class GenesisCameraSettings:
     width: int = 640
     height: int = 480
@@ -126,6 +135,16 @@ class GenesisCameraSettings:
     pos: list[float] | None = None
     lookat: list[float] | None = None
     fov: float | None = None
+
+
+def _default_genesis_viewer() -> GenesisViewerSettings:
+    from .genesis.cameras import VIEWER_PRESET
+
+    return GenesisViewerSettings(
+        pos=list(VIEWER_PRESET["pos"]),  # type: ignore[arg-type]
+        lookat=list(VIEWER_PRESET["lookat"]),  # type: ignore[arg-type]
+        fov=float(VIEWER_PRESET["fov"]),  # type: ignore[arg-type]
+    )
 
 
 def _default_genesis_cameras() -> dict[str, GenesisCameraSettings]:
@@ -139,17 +158,19 @@ def _default_genesis_cameras() -> dict[str, GenesisCameraSettings]:
 
 def _default_genesis_joints() -> dict[str, GenesisJointSettings]:
     """URDF axis sign vs LeRobot positive direction (not the 2D FK geometry block)."""
-    return {
+    out = {
         name: GenesisJointSettings(sign=sign)
         for name, sign in (
-            ("shoulder_pan", -1.0),
-            ("shoulder_lift", -1.0),
+            ("shoulder_pan", 1.0),
+            ("shoulder_lift", 1.0),
             ("elbow_flex", 1.0),
             ("wrist_flex", 1.0),
-            ("wrist_roll", -1.0),
+            ("wrist_roll", 1.0),
             ("gripper", 1.0),
         )
     }
+    out["gripper"] = GenesisJointSettings(sign=1.0, mirror_raw_deadband=0)
+    return out
 
 
 @dataclass
@@ -161,21 +182,68 @@ class GenesisJointSettings:
     urdf_max: float | None = None
     # Radians added after legacy home mapping (old → new_calib URDF frame).
     frame_offset: float = 0.0
+    # Ignore encoder jitter below this many raw counts when mirroring leader → sim.
+    mirror_raw_deadband: int | None = None
+
+
+def _default_rest_pose_deg() -> dict[str, float]:
+    """URDF degrees at ``home_raw`` for delta mapping (legacy uses cal → URDF instead)."""
+    return {
+        "shoulder_pan": 0.0,
+        "shoulder_lift": -45.0,
+        "elbow_flex": 72.0,
+        "wrist_flex": 75.0,
+        "wrist_roll": 0.0,
+        "gripper": 42.0,
+    }
 
 
 @dataclass
 class GenesisSettings:
-    urdf: str = "assets/robots/so101/so101_new_calib.urdf"
+    urdf: str = "assets/robots/so101/so101_old_calib.urdf"
     backend: str = "auto"  # auto | metal | cuda | cpu | amdgpu
+    # legacy: cal min/max → old_calib URDF (folded physical rest at home_raw)
+    # delta: rest_pose + encoder pulse delta from home_raw
+    # wide_cal: linear norm gain for 0..4095 cals on new_calib URDF
+    mapping: str = "legacy"
     dt: float = 0.01
+    # Physics substeps per dt — higher = more stable contacts (less fly-off).
+    substeps: int = 8
+    # World gravity (m/s^2).
+    gravity: list[float] = field(default_factory=lambda: [0.0, 0.0, -9.81])
     scene: str = "pick_place_desk"
     scene_file: str | None = None  # optional path override for config/scenes/*.yaml
     headless: bool = False
+    # Robot base orientation in the world (degrees, XYZ euler). Default yaws the
+    # arm to face the desk/bench (+X), where the scene objects and cameras sit.
+    base_euler: list[float] = field(default_factory=lambda: [0.0, 0.0, 90.0])
     # Servo Present_Position at rest (from `sarm-hand test-motors`); converted via calibration.
     home_raw: dict[str, int] = field(default_factory=dict)
+    # Sim URDF degrees when leader sits at home_raw (delta mapping anchor).
+    rest_pose: dict[str, float] = field(default_factory=_default_rest_pose_deg)
     calibration_role: str = "leader"  # leader | follower — which cal file for home_raw
     joints: dict[str, GenesisJointSettings] = field(default_factory=_default_genesis_joints)
     cameras: dict[str, GenesisCameraSettings] = field(default_factory=_default_genesis_cameras)
+    viewer: GenesisViewerSettings = field(default_factory=_default_genesis_viewer)
+    # Leader → sim mirror (calibrate-genesis, record-sim --leader).
+    mirror_kinematic: bool = True       # instant set_dofs_position (1:1 with leader)
+    mirror_rate_hz: float = 30.0        # leader ↔ sim loop rate (calibrate-genesis)
+    mirror_substeps: int = 1            # scene.step count per mirror (1 = fastest)
+    mirror_grasp_substeps: int = 2      # extra physics steps so gripper PD builds squeeze force
+    mirror_grasp_carry: bool = True     # latch prop to jaw when closed nearby
+    grasp_weld: bool = False            # weld constraint; false = kinematic carry + desk clamp
+    grasp_close_deg: float = 48.0       # leader gripper ° to latch (above mapped rest ~46)
+    grasp_open_deg: float = 42.0        # leader gripper ° to release (below rest = clearly open)
+    grasp_radius_m: float = 0.14        # max finger-to-prop surface distance to latch (m)
+    grasp_tight_radius_m: float = 0.08  # sim fingers nearly shut can latch within this gap
+    grasp_log: bool = True               # write grasp_log.jsonl during record-sim --leader
+    grasp_link: str = "jaw"             # carry anchor if grasp_anchor_links unset
+    grasp_anchor_links: list[str] = field(default_factory=lambda: ["gripper", "jaw"])
+    gripper_sim_extra_close_deg: float = 34.0  # sim-only tighter close when squeezing
+    gripper_sim_extra_from_deg: float = 44.0   # apply extra close once gripper moves off rest
+    mirror_raw_deadband: int = 2        # ignore ±N encoder counts of jitter
+    mirror_max_norm_step: float | None = None  # PD mode only; None → robot.max_relative_target
+    mirror_smoothing: float = 1.0         # PD mode only; 1 = instant, lower = softer
 
 
 @dataclass
@@ -435,8 +503,10 @@ class ProjectConfig:
             if isinstance(spec, dict)
         }
         genesis_kwargs = {
-            k: v for k, v in genesis_raw.items() if k not in ("cameras", "joints")
+            k: v for k, v in genesis_raw.items() if k not in ("cameras", "joints", "viewer")
         }
+        if genesis_raw.get("viewer"):
+            genesis_kwargs["viewer"] = GenesisViewerSettings(**genesis_raw["viewer"])
         if genesis_cameras:
             genesis_kwargs["cameras"] = genesis_cameras
         if genesis_joints:

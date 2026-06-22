@@ -9,6 +9,7 @@ import numpy as np
 
 from ..config import JOINT_NAMES, ProjectConfig
 from .calibration import norm_to_raw, raw_to_norm, startup_pose_norm
+from .tensors import to_numpy
 from .urdf_limits import clamp_to_urdf_limits, mapping_joint_limits, urdf_joint_limits
 
 # LeRobot SO-101 normalized range (unless use_degrees).
@@ -55,6 +56,71 @@ def _is_wide_calibration(joint: str, calibration: dict[str, dict[str, Any]]) -> 
     lo_raw = int(joint_cal["range_min"])
     hi_raw = int(joint_cal["range_max"])
     return (hi_raw - lo_raw) >= _WIDE_CAL_ENCODER_SPAN
+
+
+def _mapping_mode(cfg: ProjectConfig) -> str:
+    return (cfg.genesis.mapping or "delta").lower()
+
+
+def _use_delta_mapping(cfg: ProjectConfig) -> bool:
+    return _mapping_mode(cfg) == "delta"
+
+
+def _use_wide_cal_mapping(
+    joint: str,
+    cfg: ProjectConfig,
+    calibration: dict[str, dict[str, Any]],
+) -> bool:
+    """Wide-cal linear remap (new_calib); legacy path preserves physical joint semantics."""
+    if _use_delta_mapping(cfg) or _mapping_mode(cfg) != "wide_cal":
+        return False
+    return _is_wide_calibration(joint, calibration) and cfg.genesis.home_raw.get(joint) is not None
+
+
+def _rest_pose_radians(cfg: ProjectConfig, joint: str) -> float:
+    deg = cfg.genesis.rest_pose.get(joint, 0.0)
+    return math.radians(float(deg))
+
+
+def _encoder_delta_radians(raw: int, joint: str, cfg: ProjectConfig) -> float:
+    """Shaft rotation from ``home_raw`` in URDF radians (sign from genesis.joints)."""
+    home = cfg.genesis.home_raw.get(joint)
+    if home is None:
+        return 0.0
+    resolution = cfg.servo.resolution
+    delta_raw = int(raw) - int(home)
+    sign = float(_genesis_joint_map(cfg, joint)["sign"])
+    return sign * delta_raw * (2.0 * math.pi / resolution)
+
+
+def _delta_raw_to_radians(
+    raw: int,
+    joint: str,
+    cfg: ProjectConfig,
+    hard_limits: dict[str, tuple[float, float]],
+) -> float:
+    rad = _rest_pose_radians(cfg, joint) + _encoder_delta_radians(raw, joint, cfg)
+    lo, hi = hard_limits[joint]
+    return max(lo, min(hi, rad))
+
+
+def _delta_radians_to_raw(
+    rad: float,
+    joint: str,
+    cfg: ProjectConfig,
+    hard_limits: dict[str, tuple[float, float]],
+) -> int:
+    home = cfg.genesis.home_raw.get(joint)
+    if home is None:
+        return 0
+    sign = float(_genesis_joint_map(cfg, joint)["sign"])
+    if sign == 0:
+        sign = 1.0
+    lo, hi = hard_limits[joint]
+    bounded = max(lo, min(hi, float(rad)))
+    delta_rad = bounded - _rest_pose_radians(cfg, joint)
+    delta_raw = delta_rad * cfg.servo.resolution / (2.0 * math.pi * sign)
+    return int(round(int(home) + delta_raw))
 
 
 def _legacy_mapping_limits(
@@ -224,7 +290,9 @@ def raw_to_radians(
 ) -> float:
     """Map a servo encoder count to URDF radians using cal min/max → mapping limits."""
     hard = hard_limits or urdf_limits or urdf_joint_limits(cfg)
-    if _is_wide_calibration(joint, calibration) and cfg.genesis.home_raw.get(joint) is not None:
+    if _use_delta_mapping(cfg) and cfg.genesis.home_raw.get(joint) is not None:
+        return _delta_raw_to_radians(int(raw), joint, cfg, hard)
+    if _use_wide_cal_mapping(joint, cfg, calibration):
         norm = raw_to_norm(raw, joint, calibration)
         return _norm_to_radians_wide_cal(norm, joint, cfg, calibration, hard)
 
@@ -253,7 +321,9 @@ def radians_to_raw(
 ) -> int:
     """Map URDF radians back to a servo encoder count."""
     hard = hard_limits or urdf_limits or urdf_joint_limits(cfg)
-    if _is_wide_calibration(joint, calibration) and cfg.genesis.home_raw.get(joint) is not None:
+    if _use_delta_mapping(cfg) and cfg.genesis.home_raw.get(joint) is not None:
+        return _delta_radians_to_raw(float(value), joint, cfg, hard)
+    if _use_wide_cal_mapping(joint, cfg, calibration):
         norm = _radians_to_norm_wide_cal(value, joint, cfg, calibration, hard)
         return norm_to_raw(norm, joint, calibration)
 
@@ -309,7 +379,7 @@ def norm_to_radians(
     """Map LeRobot norm → URDF radians (via servo counts when calibration is set)."""
     hard = urdf_limits or urdf_joint_limits(cfg)
     if calibration is not None:
-        if _is_wide_calibration(joint, calibration) and cfg.genesis.home_raw.get(joint) is not None:
+        if _use_wide_cal_mapping(joint, cfg, calibration):
             return _norm_to_radians_wide_cal(float(value), joint, cfg, calibration, hard)
         raw = norm_to_raw(value, joint, calibration)
         return raw_to_radians(raw, joint, cfg, calibration, urdf_limits=urdf_limits)
@@ -340,7 +410,7 @@ def radians_to_norm(
 
     hard = urdf_limits or urdf_joint_limits(cfg)
     if calibration is not None:
-        if _is_wide_calibration(joint, calibration) and cfg.genesis.home_raw.get(joint) is not None:
+        if _use_wide_cal_mapping(joint, cfg, calibration):
             return _radians_to_norm_wide_cal(float(value), joint, cfg, calibration, hard)
         raw = radians_to_raw(value, joint, cfg, calibration, urdf_limits=urdf_limits)
         return raw_to_norm(raw, joint, calibration)
@@ -415,6 +485,7 @@ def agent_pos_from_qpos(
     urdf_limits: dict[str, tuple[float, float]] | None = None,
 ) -> np.ndarray:
     """Convert Genesis DOF positions to a float32 state vector."""
+    qpos = to_numpy(qpos)
     return np.array(
         [
             radians_to_norm(

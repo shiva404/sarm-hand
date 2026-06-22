@@ -81,6 +81,38 @@ def norm_to_raw(norm: float, joint: str, calibration: dict[str, dict[str, Any]])
     return int(round(((val + 100.0) / 200.0) * (hi - lo) + lo))
 
 
+def travel_fraction(raw: int, joint: str, calibration: dict[str, dict[str, Any]]) -> float:
+    """Fraction [0, 1] along calibrated joint travel (independent of homing offset)."""
+    joint_cal = calibration[joint]
+    lo = int(joint_cal["range_min"])
+    hi = int(joint_cal["range_max"])
+    span = hi - lo
+    bounded = max(lo, min(hi, int(raw)))
+    if span == 0:
+        return 0.5
+    t = (bounded - lo) / span
+    if bool(joint_cal.get("drive_mode", 0)):
+        t = 1.0 - t
+    return float(t)
+
+
+def norm_from_travel_fraction(
+    fraction: float,
+    joint: str,
+    calibration: dict[str, dict[str, Any]],
+) -> float:
+    """Map travel fraction to LeRobot norm on this arm's calibrated range."""
+    joint_cal = calibration[joint]
+    lo = int(joint_cal["range_min"])
+    hi = int(joint_cal["range_max"])
+    span = hi - lo
+    t = max(0.0, min(1.0, float(fraction)))
+    if bool(joint_cal.get("drive_mode", 0)):
+        t = 1.0 - t
+    raw = int(round(lo + t * span)) if span else lo
+    return raw_to_norm(raw, joint, calibration)
+
+
 def raw_positions_to_norm(
     raw: dict[str, int],
     calibration: dict[str, dict[str, Any]],
