@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .cameras import build_robot_camera_configs
+from .cameras import build_robot_camera_configs, connect_follower_robot, install_all_camera_patches
 from .config import ProjectConfig
 from .robot import _motor_write_retries, ensure_port, require_all_motors
 
@@ -17,16 +17,17 @@ def _policy_fps(cfg: ProjectConfig) -> int:
     return cfg.policy.control_fps
 
 
+def resolve_camera_map(cfg: ProjectConfig, *, genesis: bool = False) -> dict[str, str]:
+    """Camera name → policy image key. Default: identity from cameras: / genesis.cameras:."""
+    if cfg.policy.camera_map:
+        return dict(cfg.policy.camera_map)
+    names = cfg.genesis.cameras if genesis else cfg.cameras
+    return {name: name for name in names}
+
+
 def build_policy_rename_map(cfg: ProjectConfig, *, genesis: bool = False) -> dict[str, str]:
     """Map observation.images.<robot_cam> → observation.images.<policy_cam>."""
-    mapping = dict(cfg.policy.camera_map)
-    if genesis:
-        if not mapping and cfg.genesis.cameras:
-            first = next(iter(cfg.genesis.cameras))
-            mapping[first] = "camera1"
-    elif not mapping and cfg.cameras:
-        first = next(iter(cfg.cameras))
-        mapping[first] = "camera1"
+    mapping = resolve_camera_map(cfg, genesis=genesis)
     return {
         f"observation.images.{src}": f"observation.images.{dst}"
         for src, dst in mapping.items()
@@ -119,9 +120,13 @@ def resolve_policy_normalization_stats(
 
     from lerobot.processor.rename_processor import rename_stats
 
-    dataset_root = cfg.resolve_dataset_root()
-    train_id = cfg.policy.train_dataset or cfg.dataset.repo_id
-    stats_path = dataset_root / train_id / "meta" / "stats.json"
+    train_id = cfg.policy.train_dataset
+    if not train_id:
+        from .data import read_latest_session_pointer
+
+        session = read_latest_session_pointer(cfg)
+        train_id = session[0] if session else cfg.dataset.repo_id
+    stats_path = cfg.resolve_dataset_path(train_id) / "meta" / "stats.json"
     if stats_path.is_file():
         stats = json.loads(stats_path.read_text())
         if stats:
@@ -602,6 +607,7 @@ def _run_smolvla_inference(
     display_data: bool,
     device: str,
 ) -> None:
+    install_all_camera_patches()
     import rerun as rr
     from lerobot.robots.so_follower import SO101Follower
     from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
@@ -640,7 +646,10 @@ def _run_smolvla_inference(
 
     try:
         with _motor_write_retries():
-            robot.connect()
+            if cfg.cameras:
+                connect_follower_robot(robot, calibrate=False)
+            else:
+                robot.connect()
         _policy_episode(
             robot=robot,
             policy=stack["policy"],
@@ -759,16 +768,28 @@ def _run_smolvla_record(
     display_data: bool,
 ) -> None:
     resolved_repo_id = repo_id or f"{cfg.dataset.repo_id}-smolvla-eval"
-    dataset_root = cfg.resolve_dataset_root()
-    dataset_root.mkdir(parents=True, exist_ok=True)
+    from .data import configure_local_lerobot_env, write_latest_session_pointer, write_session_manifest
+    from .dataset_session import resolve_recording_paths
+    from .record import _lerobot_dataset_flags, _run_lerobot_record
+
+    configure_local_lerobot_env(cfg)
+    session_repo_id, dataset_dir = resolve_recording_paths(
+        base_repo=resolved_repo_id,
+        root=cfg.resolve_dataset_root(),
+        repo_id=repo_id,
+        resume=False,
+        timestamp=True,
+    )
+    dataset_dir.parent.mkdir(parents=True, exist_ok=True)
+    write_latest_session_pointer(cfg, session_repo_id, dataset_dir)
 
     cmd = [
         "lerobot-record",
         f"--robot.type={cfg.robot.type}",
         f"--robot.port={follower_port}",
         f"--robot.id={cfg.robot.id}",
-        f"--dataset.repo_id={resolved_repo_id}",
-        f"--dataset.root={dataset_root}",
+        f"--dataset.repo_id={session_repo_id}",
+        f"--dataset.root={dataset_dir.resolve()}",
         f"--dataset.fps={_policy_fps(cfg)}",
         f"--dataset.num_episodes={num_episodes}",
         f"--dataset.single_task={task}",
@@ -777,6 +798,7 @@ def _run_smolvla_record(
         "--dataset.push_to_hub=false",
         f"--policy.path={policy_path}",
         f"--display_data={'true' if display_data else 'false'}",
+        *_lerobot_dataset_flags(cfg),
     ]
 
     cameras = cfg.cameras_lerobot_dict()
@@ -784,9 +806,9 @@ def _run_smolvla_record(
         cmd.append(f"--robot.cameras={cameras!r}")
     cmd.extend(_smolvla_record_flags(cfg))
 
-    print(f"Recording {num_episodes} SmolVLA episode(s) → {resolved_repo_id}")
+    print(f"Recording {num_episodes} SmolVLA episode(s) → {session_repo_id}")
     print(f"Task: {task!r}\n")
-    subprocess.run(cmd, check=True)
+    _run_lerobot_record(cmd, dataset_dir=dataset_dir, session_repo_id=session_repo_id)
 
 
 def train_smolvla(
@@ -801,19 +823,23 @@ def train_smolvla(
     """Fine-tune SmolVLA on a recorded LeRobot dataset."""
     ensure_smolvla()
     cfg = ProjectConfig.load()
-    resolved_dataset = dataset_repo_id or cfg.policy.train_dataset or cfg.dataset.repo_id
+    from .data import configure_local_lerobot_env, resolve_training_dataset
+
+    configure_local_lerobot_env(cfg)
+    override = dataset_repo_id or cfg.policy.train_dataset
+    resolved_dataset, dataset_dir = resolve_training_dataset(cfg, override, require_frames=True)
+
     resolved_policy = policy_path or cfg.policy.path
     resolved_output = output_dir or cfg.policy.output_dir
     resolved_steps = steps if steps is not None else cfg.policy.train_steps
     resolved_batch = batch_size if batch_size is not None else cfg.policy.train_batch_size
     resolved_device = resolve_device(device or cfg.policy.device)
-    dataset_root = cfg.resolve_dataset_root()
 
     cmd = [
         "lerobot-train",
         f"--policy.path={resolved_policy}",
         f"--dataset.repo_id={resolved_dataset}",
-        f"--dataset.root={dataset_root}",
+        f"--dataset.root={dataset_dir.resolve()}",
         f"--batch_size={resolved_batch}",
         f"--steps={resolved_steps}",
         f"--output_dir={resolved_output}",
@@ -825,6 +851,7 @@ def train_smolvla(
     print("Fine-tuning SmolVLA")
     print(f"  Base model:  {resolved_policy}")
     print(f"  Dataset:     {resolved_dataset}")
+    print(f"  Local path:  {dataset_dir}")
     print(f"  Steps:       {resolved_steps}")
     print(f"  Output:      {resolved_output}")
     print(f"  Device:      {resolved_device}\n")

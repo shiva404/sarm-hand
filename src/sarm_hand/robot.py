@@ -455,6 +455,59 @@ def _calibration_sync_read_retries(min_retries: int = 5):
         MotorsBus.sync_read = original
 
 
+def _calibration_dict_to_motor_cal(
+    cal: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    from lerobot.motors import MotorCalibration
+
+    return {
+        joint: MotorCalibration(
+            id=int(entry["id"]),
+            drive_mode=int(entry.get("drive_mode", 0)),
+            homing_offset=int(entry["homing_offset"]),
+            range_min=int(entry["range_min"]),
+            range_max=int(entry["range_max"]),
+        )
+        for joint, entry in cal.items()
+    }
+
+
+def ensure_bus_calibration(
+    device: Any,
+    role: str,
+    *,
+    cfg: ProjectConfig | None = None,
+) -> None:
+    """Load saved calibration onto servos without interactive prompts."""
+    if device.is_calibrated:
+        return
+
+    if not device.calibration and device.calibration_fpath.is_file():
+        device._load_calibration()
+
+    if not device.calibration:
+        from .genesis.calibration import calibration_path, load_calibration
+
+        cfg = cfg or ProjectConfig.load()
+        cal_dict = load_calibration(role, cfg)
+        if cal_dict:
+            device.calibration = _calibration_dict_to_motor_cal(cal_dict)
+
+    if not device.calibration:
+        from .genesis.calibration import calibration_path
+
+        cfg = cfg or ProjectConfig.load()
+        print(
+            f"{role.capitalize()} has no calibration file at {calibration_path(role, cfg)}.\n"
+            f"Run:  uv run sarm-hand calibrate --role {role}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if not device.is_calibrated:
+        device.bus.write_calibration(device.calibration)
+
+
 def _make_calibrate_device(role: str, port: str, resolved_id: str, cfg: ProjectConfig) -> Any:
     if role == "follower":
         from lerobot.robots.so_follower import SO101Follower
@@ -483,6 +536,9 @@ def calibrate(role: str, port: str, robot_id: str | None = None) -> None:
     require_all_motors(role, port, context="calibrate")
 
     cfg = ProjectConfig.load()
+    from .data import configure_local_lerobot_env
+
+    configure_local_lerobot_env(cfg)
     resolved_id = robot_id or (
         cfg.robot.id if role == "follower" else cfg.teleop.leader.id
     )

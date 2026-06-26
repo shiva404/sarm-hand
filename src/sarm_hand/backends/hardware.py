@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..config import ProjectConfig
-from ..cameras import build_robot_camera_configs
+from ..cameras import build_robot_camera_configs, connect_follower_robot
 from .base import RobotBackend
 
 
@@ -13,6 +13,9 @@ class HardwareRobot(RobotBackend):
     """Wraps LeRobot SO101Follower."""
 
     def __init__(self, port: str, cfg: ProjectConfig, *, use_cameras: bool = True):
+        from ..cameras import install_all_camera_patches
+
+        install_all_camera_patches()
         from lerobot.robots.so_follower import SO101Follower
         from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
@@ -55,7 +58,10 @@ class HardwareRobot(RobotBackend):
         return self._robot.is_connected
 
     def connect(self) -> None:
-        self._robot.connect()
+        if self._robot.cameras:
+            connect_follower_robot(self._robot, calibrate=False)
+        else:
+            self._robot.connect(calibrate=False)
 
     def disconnect(self) -> None:
         self._robot.disconnect()

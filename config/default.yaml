@@ -15,6 +15,9 @@ teleop:
     type: so101_leader
     id: sarm101_leader
     port: /dev/tty.usbmodem5B140289771
+  # Follower command rate — decoupled from dataset.fps (cameras still record at dataset.fps).
+  control_fps: 30
+  action_smoothing: 0.55   # 1.0 = off; lower = smoother (slight lag)
   quest:
     # phosphobot server settings for Meta Quest 2 teleoperation
     host: "0.0.0.0"
@@ -23,36 +26,64 @@ teleop:
 
 cameras:
   # Used by record-leader / record-policy. Teleop: add --with-cameras.
+  # USB: auto_resolution + width/height → capture natively, downscale to 640x480.
+  # UDP: ESP32-CAM chunked JPEG (esp32cam firmware) — decoded on Mac, not HTTP.
+  # Run `sarm-hand list-cameras` for USB indices; `camera-preview --name top` for stream.
   front:
-    type: http
-    url: http://192.168.0.58:81/stream
-    # Declared for LeRobot robot config; stream native resolution used at connect
+    type: opencv
+    index_or_path: 0
+    auto_resolution: true
     width: 640
     height: 480
-    fps: 10
+    fps: 5
+    warmup_s: 3
+  top:
+    type: udp
+    host: 192.168.0.58
+    port: 82
+    width: 640
+    height: 480
+    fps: 5
+    warmup_s: 3
+    connect_grace_s: 10
+    fps_window: 5
+    rotate_180: true
+    flip_horizontal: true
+  arm:
+    type: opencv
+    index_or_path: 1
+    auto_resolution: true
+    width: 640
+    height: 480
+    fps: 5
+    warmup_s: 3
 
 policy:
   path: lerobot/smolvla_base
   device: null              # cuda, mps, or cpu (auto-detect if null)
   episode_time_s: 60
   control_fps: 10           # policy/record loop rate (5–10 recommended with HTTP cam)
-  camera_map:
-    front: camera1          # map robot camera → SmolVLA camera slot
-  empty_cameras: 2          # pad camera2/camera3 when using one physical camera
-  train_dataset: null       # defaults to dataset.repo_id for train-smolvla
+  # camera_map omitted — uses cameras: keys (front, top, arm) automatically
+  empty_cameras: 0
+  train_dataset: null       # defaults to latest record-leader session (see data/datasets/.latest_session)
   train_steps: 20000
   train_batch_size: 64
   output_dir: outputs/train/sarm101_smolvla
 
 dataset:
   repo_id: local/sarm101-dataset
-  root: data/datasets
-  fps: 10
+  root: data/datasets          # local only; record-leader → same paths as record-sim
+  fps: 5
   single_task: "Pick and place the object"
   num_episodes: 50
   episode_time_s: 60
   reset_time_s: 10
-  push_to_hub: false
+  push_to_hub: false           # never upload unless --push-to-hub on record-leader or data-push
+  video: true                  # save camera MP4s under videos/ (same as record-sim)
+  streaming_encoding: false    # record-sim style: PNG frames → encode on save_episode
+  vcodec: auto
+  num_image_writer_threads_per_camera: 4
+  display_rerun: false        # live Rerun during record-leader (3 cams → memory limit; use --rerun to enable)
 
 # Lightweight leader demos for `sarm-hand task record` / `task replay` (JSON under data/tasks/)
 tasks:

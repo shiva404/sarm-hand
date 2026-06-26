@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -21,44 +20,8 @@ from .genesis.shutdown import (
     interruptible_sleep,
     shutdown_requested,
 )
+from .dataset_session import recording_stamp, resolve_recording_paths
 from .genesis.units import action_dict_to_vector, agent_pos_from_qpos
-
-
-def _recording_stamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-
-
-def resolve_recording_paths(
-    *,
-    base_repo: str,
-    root: Path,
-    repo_id: str | None,
-    resume: bool,
-    timestamp: bool,
-) -> tuple[str, Path]:
-    """Pick a dataset repo_id and directory for a recording session.
-
-    By default each run uses a fresh timestamped folder so prior datasets are never
-    overwritten. Pass ``resume=True`` with an explicit ``repo_id`` to append episodes.
-    """
-    base = repo_id or base_repo
-    if resume:
-        path = root / base
-        if not path.exists():
-            print(f"Cannot resume: dataset not found at {path}", file=sys.stderr)
-            raise SystemExit(1)
-        return base, path
-
-    if timestamp:
-        stamped = f"{base}-{_recording_stamp()}"
-        return stamped, root / stamped
-
-    path = root / base
-    if path.exists():
-        print(f"Dataset already exists: {path}", file=sys.stderr)
-        print("Use default timestamped recording, or pass --resume to append.", file=sys.stderr)
-        raise SystemExit(1)
-    return base, path
 
 
 def _genesis_dataset_features(

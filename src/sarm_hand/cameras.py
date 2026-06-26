@@ -1,22 +1,27 @@
-"""Camera integration: USB devices and HTTP/RTSP streams via LeRobot OpenCV backend."""
+"""Camera integration: USB, HTTP/RTSP, and ESP32 UDP JPEG via LeRobot backends."""
 
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import platform
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .config import CameraSettings, ProjectConfig
 
+logger = logging.getLogger(__name__)
+
 STREAM_PREFIXES = ("http://", "https://", "rtsp://", "rtmp://")
 STREAM_TYPES = frozenset({"http", "https", "rtsp", "rtmp", "stream"})
+UDP_TYPES = frozenset({"udp", "esp32_udp", "esp32udp"})
 
 # macOS/Windows: stop scanning after this many consecutive misses (not 0..59).
 _MAX_CONSECUTIVE_MISSES = 2
@@ -49,8 +54,9 @@ def _quiet_opencv():
             cv2.setLogLevel(saved_level)
 
 
-def _probe_usb_camera(cv2, target: int | str) -> dict[str, Any] | None:
-    camera = cv2.VideoCapture(target)
+def _probe_usb_camera(cv2, target: int | str, *, backend: int | None = None) -> dict[str, Any] | None:
+    api = backend if backend is not None else cv2.CAP_ANY
+    camera = cv2.VideoCapture(target, api)
     try:
         if not camera.isOpened():
             return None
@@ -81,10 +87,30 @@ def _probe_usb_camera(cv2, target: int | str) -> dict[str, Any] | None:
         camera.release()
 
 
-def find_usb_cameras() -> list[dict[str, Any]]:
+def _verify_usb_capture(cv2, target: int | str, *, backend: int | None = None) -> bool:
+    """True when OpenCV can read at least one frame (opens-only is not enough on macOS)."""
+    api = backend if backend is not None else cv2.CAP_ANY
+    if platform.system() == "Darwin":
+        api = cv2.CAP_AVFOUNDATION
+    camera = cv2.VideoCapture(target, api)
+    try:
+        if not camera.isOpened():
+            return False
+        for _ in range(20):
+            ok, _ = camera.read()
+            if ok:
+                return True
+            time.sleep(0.05)
+        return False
+    finally:
+        camera.release()
+
+
+def find_usb_cameras(*, verify_capture: bool = False) -> list[dict[str, Any]]:
     """Discover USB cameras without spamming OpenCV errors."""
     import cv2
 
+    prepare_opencv_platform()
     found: list[dict[str, Any]] = []
 
     with _quiet_opencv():
@@ -93,13 +119,19 @@ def find_usb_cameras() -> list[dict[str, Any]]:
             for path in targets:
                 info = _probe_usb_camera(cv2, str(path))
                 if info:
+                    if verify_capture:
+                        info["captures"] = _verify_usb_capture(cv2, str(path))
                     found.append(info)
         else:
             max_index = _MAX_INDEX_DARWIN if platform.system() == "Darwin" else _MAX_INDEX_OTHER
             consecutive_misses = 0
             for index in range(max_index):
-                info = _probe_usb_camera(cv2, index)
+                info = _probe_usb_camera(
+                    cv2, index, backend=cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else None
+                )
                 if info:
+                    if verify_capture:
+                        info["captures"] = _verify_usb_capture(cv2, index)
                     found.append(info)
                     consecutive_misses = 0
                 else:
@@ -108,6 +140,11 @@ def find_usb_cameras() -> list[dict[str, Any]]:
                         break
 
     return found
+
+
+def working_usb_camera_ids() -> list[int | str]:
+    """USB indices/paths that both open and deliver at least one frame."""
+    return [cam["id"] for cam in find_usb_cameras(verify_capture=True) if cam.get("captures")]
 
 
 def _macos_camera_names() -> list[str]:
@@ -140,7 +177,8 @@ def _macos_camera_names() -> list[str]:
 
 def list_usb_cameras() -> None:
     """List USB cameras detected by OpenCV."""
-    cameras = find_usb_cameras()
+    print("Scanning USB cameras (verifying frame capture)...")
+    cameras = find_usb_cameras(verify_capture=True)
     if not cameras:
         print("No USB cameras found.")
         print("Tips:")
@@ -152,21 +190,86 @@ def list_usb_cameras() -> None:
         print("  - For HTTP streams, use type: http with a url in config/default.yaml")
         return
 
-    print(f"Found {len(cameras)} USB camera(s):\n")
+    working = [cam for cam in cameras if cam.get("captures")]
+    print(f"Found {len(cameras)} device(s), {len(working)} capture frames:\n")
     mac_names = _macos_camera_names()
     for i, info in enumerate(cameras):
         profile = info.get("default_stream_profile", {})
         label = info["name"]
         if i < len(mac_names):
             label = f"{mac_names[i]} ({info['id']!r})"
+        capture = "yes" if info.get("captures") else "NO — opens but no frames"
         print(f"  {label}")
-        print(f"    id:      {info['id']!r}")
-        print(f"    backend: {info.get('backend_api', 'unknown')}")
+        print(f"    id:       {info['id']!r}")
+        print(f"    captures: {capture}")
+        print(f"    backend:  {info.get('backend_api', 'unknown')}")
         print(
-            f"    default: {profile.get('width')}x{profile.get('height')} "
+            f"    default:  {profile.get('width')}x{profile.get('height')} "
             f"@ {profile.get('fps')} fps ({profile.get('fourcc', '?')})"
         )
         print()
+
+    if len(working) < len(cameras):
+        print(
+            "Some indices open but never deliver frames — reseat USB, try another port,\n"
+            "or close FaceTime/Zoom. Use only indices with captures: yes in config/default.yaml."
+        )
+
+
+def is_udp_camera(cam: CameraSettings) -> bool:
+    if cam.type.lower() in UDP_TYPES:
+        return True
+    source = cam.url or (cam.index_or_path if isinstance(cam.index_or_path, str) else None)
+    if source:
+        from .esp32_udp_camera import is_esp32_udp_source
+
+        if is_esp32_udp_source(str(source)):
+            return True
+    return bool(cam.host)
+
+
+def resolve_udp_endpoint(cam: CameraSettings) -> tuple[str, int]:
+    if cam.host:
+        return cam.host, int(cam.port or 82)
+    source = cam.url or (cam.index_or_path if isinstance(cam.index_or_path, str) else "")
+    from .esp32_udp_camera import normalize_esp32_udp_source
+
+    key = normalize_esp32_udp_source(str(source))
+    if key is not None:
+        rest = key[len("esp32udp:") :]
+        host, sep, port_str = rest.rpartition(":")
+        if not sep:
+            raise ValueError(f"Invalid ESP32 UDP source: {source!r}")
+        return host, int(port_str or 82)
+    raise ValueError(f"Camera type '{cam.type}' requires 'host' in config")
+
+
+def _esp32_udp_source(cam: CameraSettings) -> str:
+    host, port = resolve_udp_endpoint(cam)
+    return f"esp32udp:{host}:{port}"
+
+
+def _register_udp_camera(cam: CameraSettings) -> str:
+    from .esp32_udp_camera import register_udp_options
+    from .esp32_udp_stream import UdpStreamOptions
+
+    host, port = resolve_udp_endpoint(cam)
+    source = f"esp32udp:{host}:{port}"
+    register_udp_options(
+        source,
+        UdpStreamOptions(
+            host=host,
+            port=port,
+            rotate_180=cam.rotate_180,
+            flip_horizontal=cam.flip_horizontal,
+            stale_sec=cam.stale_sec,
+            connect_grace_s=cam.connect_grace_s,
+            fps_window=cam.fps_window,
+            hold_fps=True,
+            target_fps=float(cam.fps) if cam.fps else None,
+        ),
+    )
+    return source
 
 
 def is_stream_url(source: str) -> bool:
@@ -174,6 +277,8 @@ def is_stream_url(source: str) -> bool:
 
 
 def is_stream_camera(cam: CameraSettings) -> bool:
+    if is_udp_camera(cam):
+        return False
     if cam.type.lower() in STREAM_TYPES:
         return True
     source = cam.url or (cam.index_or_path if isinstance(cam.index_or_path, str) else None)
@@ -181,8 +286,11 @@ def is_stream_camera(cam: CameraSettings) -> bool:
 
 
 def resolve_camera_source(cam: CameraSettings) -> int | str | Path:
-    """Return the OpenCV VideoCapture source for a camera config."""
+    """Return capture source: USB index/path, HTTP URL, or esp32udp:host:port."""
     cam_type = cam.type.lower()
+
+    if is_udp_camera(cam):
+        return _register_udp_camera(cam)
 
     if cam_type in STREAM_TYPES:
         if not cam.url:
@@ -202,6 +310,35 @@ def resolve_camera_source(cam: CameraSettings) -> int | str | Path:
 
 
 _STREAM_MAX_FRAME_AGE_MS: dict[str, int] = {}
+# USB capture at native resolution, downscale to this size on read (key = str(source)).
+_OUTPUT_SIZE_BY_SOURCE: dict[str, tuple[int, int]] = {}
+
+
+def _source_key(source: int | str | Path) -> str:
+    return str(source)
+
+
+def _wants_downscale(cam: CameraSettings) -> bool:
+    """Capture natively (auto_resolution) but deliver width×height frames."""
+    return (
+        bool(cam.auto_resolution)
+        and not is_stream_camera(cam)
+        and not is_udp_camera(cam)
+        and cam.width is not None
+        and cam.height is not None
+    )
+
+
+def _register_output_size(source: int | str | Path, width: int, height: int) -> None:
+    _OUTPUT_SIZE_BY_SOURCE[_source_key(source)] = (int(width), int(height))
+
+
+def _declared_camera_dims(cam: CameraSettings) -> tuple[int, int, int]:
+    """Width, height, fps for LeRobot robot config (output / dataset dimensions)."""
+    w = int(cam.width or 640)
+    h = int(cam.height or 480)
+    fps = int(cam.fps if cam.fps is not None else 30)
+    return w, h, fps
 
 
 def _default_stream_max_frame_age(fps: float | int | None) -> int:
@@ -223,11 +360,22 @@ def effective_camera_settings(cam: CameraSettings) -> CameraSettings:
         if cam.height is None:
             updates["height"] = 480
         if cam.fps is None:
-            updates["fps"] = 10
+            updates["fps"] = 5
         if cam.warmup_s is None:
             updates["warmup_s"] = 3
         if cam.max_frame_age_ms is None:
-            updates["max_frame_age_ms"] = _default_stream_max_frame_age(cam.fps)
+            updates["max_frame_age_ms"] = _default_stream_max_frame_age(cam.fps or 5)
+    elif is_udp_camera(cam):
+        if cam.width is None:
+            updates["width"] = 640
+        if cam.height is None:
+            updates["height"] = 480
+        if cam.fps is None:
+            updates["fps"] = 5
+        if cam.warmup_s is None:
+            updates["warmup_s"] = 3
+        if cam.max_frame_age_ms is None:
+            updates["max_frame_age_ms"] = _default_stream_max_frame_age(cam.fps or 5)
     elif cam.warmup_s is None and platform.system() == "Darwin":
         updates["warmup_s"] = 3
     if updates:
@@ -296,6 +444,66 @@ def install_stream_camera_patch() -> None:
     _STREAM_CAMERA_PATCHED = True
 
 
+_USB_DOWNSCALE_PATCHED = False
+
+
+def install_usb_downscale_patch() -> None:
+    """Downscale native USB frames to configured output width×height after capture."""
+    global _USB_DOWNSCALE_PATCHED
+    if _USB_DOWNSCALE_PATCHED:
+        return
+
+    import cv2
+    from lerobot.cameras.opencv import camera_opencv
+    from lerobot.utils.errors import DeviceNotConnectedError
+
+    original_configure = camera_opencv.OpenCVCamera._configure_capture_settings
+
+    def _configure_capture_settings(self) -> None:
+        out = _OUTPUT_SIZE_BY_SOURCE.get(_source_key(self.index_or_path))
+        if out is None:
+            original_configure(self)
+            return
+
+        if self.config.fourcc is not None:
+            self._validate_fourcc()
+        if self.videocapture is None:
+            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+        native_w = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        native_h = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self.capture_width, self.capture_height = native_w, native_h
+        actual_fps = float(self.videocapture.get(cv2.CAP_PROP_FPS))
+        if actual_fps > 0:
+            self.fps = actual_fps
+
+    original_post = camera_opencv.OpenCVCamera._postprocess_image
+
+    def _postprocess_image(self, image):
+        processed = original_post(self, image)
+        out = _OUTPUT_SIZE_BY_SOURCE.get(_source_key(self.index_or_path))
+        if out is None:
+            return processed
+        w, h = out
+        ph, pw = processed.shape[:2]
+        if (pw, ph) != (w, h):
+            processed = cv2.resize(processed, (w, h), interpolation=cv2.INTER_AREA)
+        return processed
+
+    original_connect = camera_opencv.OpenCVCamera.connect
+
+    def connect(self, warmup: bool = True) -> None:
+        original_connect(self, warmup=warmup)
+        out = _OUTPUT_SIZE_BY_SOURCE.get(_source_key(self.index_or_path))
+        if out is not None:
+            self.width, self.height = out
+
+    camera_opencv.OpenCVCamera._postprocess_image = _postprocess_image
+    camera_opencv.OpenCVCamera.connect = connect
+    camera_opencv.OpenCVCamera._configure_capture_settings = _configure_capture_settings
+    _USB_DOWNSCALE_PATCHED = True
+
+
 def native_usb_profile(source: int | str) -> dict[str, Any] | None:
     for info in find_usb_cameras():
         if info["id"] == source:
@@ -305,19 +513,27 @@ def native_usb_profile(source: int | str) -> dict[str, Any] | None:
 
 def camera_to_lerobot_dict(cam: CameraSettings) -> dict[str, Any]:
     """Serialize one camera for lerobot-record CLI flags."""
-    cam = effective_camera_settings(cam)
+    capture = effective_camera_settings(cam)
+    source = resolve_camera_source(cam)
+    out_w, out_h, out_fps = _declared_camera_dims(cam)
+    if _wants_downscale(cam):
+        install_usb_downscale_patch()
+        _register_output_size(source, out_w, out_h)
     payload: dict[str, Any] = {
         "type": "opencv",
-        "index_or_path": resolve_camera_source(cam),
+        "index_or_path": source,
+        "width": out_w if _wants_downscale(cam) else capture.width,
+        "height": out_h if _wants_downscale(cam) else capture.height,
+        "fps": out_fps if _wants_downscale(cam) else capture.fps,
     }
-    if cam.fps is not None:
-        payload["fps"] = cam.fps
-    if cam.width is not None:
-        payload["width"] = cam.width
-    if cam.height is not None:
-        payload["height"] = cam.height
-    if cam.warmup_s is not None:
-        payload["warmup_s"] = cam.warmup_s
+    if payload.get("width") is None:
+        payload.pop("width", None)
+    if payload.get("height") is None:
+        payload.pop("height", None)
+    if payload.get("fps") is None:
+        payload.pop("fps", None)
+    if capture.warmup_s is not None:
+        payload["warmup_s"] = capture.warmup_s
     if cam.fourcc is not None:
         payload["fourcc"] = cam.fourcc
     return payload
@@ -328,27 +544,394 @@ def build_lerobot_camera_config(cam: CameraSettings):
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
     install_stream_camera_patch()
-    cam = effective_camera_settings(cam)
+    install_usb_downscale_patch()
+    capture = effective_camera_settings(cam)
     source = resolve_camera_source(cam)
+    out_w, out_h, out_fps = _declared_camera_dims(cam)
+    if _wants_downscale(cam):
+        _register_output_size(source, out_w, out_h)
     if is_stream_camera(cam) and cam.max_frame_age_ms is not None:
         _STREAM_MAX_FRAME_AGE_MS[str(source)] = cam.max_frame_age_ms
+    if is_udp_camera(cam) and cam.max_frame_age_ms is not None:
+        _STREAM_MAX_FRAME_AGE_MS[str(source)] = cam.max_frame_age_ms
     kwargs: dict[str, Any] = {"index_or_path": source}
-    if cam.fps is not None:
-        kwargs["fps"] = cam.fps
-    if cam.width is not None:
-        kwargs["width"] = cam.width
-    if cam.height is not None:
-        kwargs["height"] = cam.height
-    if cam.warmup_s is not None:
-        kwargs["warmup_s"] = cam.warmup_s
+    if _wants_downscale(cam):
+        kwargs.update(width=out_w, height=out_h, fps=out_fps)
+    else:
+        if capture.fps is not None:
+            kwargs["fps"] = capture.fps
+        if capture.width is not None:
+            kwargs["width"] = capture.width
+        if capture.height is not None:
+            kwargs["height"] = capture.height
+    if capture.warmup_s is not None:
+        kwargs["warmup_s"] = capture.warmup_s
+    elif _wants_downscale(cam) and platform.system() == "Darwin":
+        kwargs["warmup_s"] = 3
     if cam.fourcc is not None:
         kwargs["fourcc"] = cam.fourcc
+    if platform.system() == "Darwin" and not is_stream_camera(cam):
+        from lerobot.cameras.configs import Cv2Backends
+
+        kwargs["backend"] = Cv2Backends.AVFOUNDATION
     return OpenCVCameraConfig(**kwargs)
+
+
+_RESILIENT_CAMERA_PATCHED = False
+_FOLLOWER_CONNECT_PATCHED = False
+_UDP_CAMERA_PATCHED = False
+
+
+def black_frame(height: int, width: int):
+    """RGB uint8 frame filled with black (failed / missing camera placeholder)."""
+    import numpy as np
+
+    return np.zeros((int(height), int(width), 3), dtype=np.uint8)
+
+
+def _fallback_dims(camera: Any) -> tuple[int, int, int]:
+    w = int(getattr(camera, "width", None) or getattr(camera.config, "width", None) or 640)
+    h = int(getattr(camera, "height", None) or getattr(camera.config, "height", None) or 480)
+    fps = int(getattr(camera, "fps", None) or getattr(camera.config, "fps", None) or 30)
+    return w, h, fps
+
+
+def _enable_black_fallback(camera: Any, reason: Exception, *, label: str | None = None) -> None:
+    w, h, fps = _fallback_dims(camera)
+    camera.width = w
+    camera.height = h
+    camera.fps = fps
+    camera._sarm_black_fallback = True  # noqa: SLF001
+    tag = label or camera
+    print(f"  {tag}: using black {w}x{h} frames ({reason})")
+
+
+def install_resilient_camera_patch() -> None:
+    """On connect/read failure, emit black frames so recording can continue."""
+    global _RESILIENT_CAMERA_PATCHED
+    if _RESILIENT_CAMERA_PATCHED:
+        return
+
+    from lerobot.cameras.opencv import camera_opencv
+
+    original_connect = camera_opencv.OpenCVCamera.connect
+    original_disconnect = camera_opencv.OpenCVCamera.disconnect
+    original_is_connected = camera_opencv.OpenCVCamera.is_connected.fget
+    original_read = camera_opencv.OpenCVCamera.read
+    original_async_read = camera_opencv.OpenCVCamera.async_read
+    original_read_latest = camera_opencv.OpenCVCamera.read_latest
+
+    def is_connected(self) -> bool:
+        if getattr(self, "_sarm_black_fallback", False):
+            return True
+        return original_is_connected(self)
+
+    def connect(self, warmup: bool = True) -> None:
+        if getattr(self, "_sarm_black_fallback", False):
+            return
+        try:
+            original_connect(self, warmup=warmup)
+        except Exception as exc:
+            _enable_black_fallback(self, exc)
+
+    def disconnect(self) -> None:
+        if getattr(self, "_sarm_black_fallback", False):
+            self._sarm_black_fallback = False
+            return
+        original_disconnect(self)
+
+    def _read_black_or_live(read_fn, self, *args, **kwargs):
+        if getattr(self, "_sarm_black_fallback", False):
+            return black_frame(self.height, self.width)
+        try:
+            return read_fn(self, *args, **kwargs)
+        except (TimeoutError, RuntimeError, ConnectionError) as exc:
+            warnings.warn(f"{self} read failed — black frame ({exc})", stacklevel=2)
+            return black_frame(self.height, self.width)
+
+    camera_opencv.OpenCVCamera.is_connected = property(is_connected)
+    camera_opencv.OpenCVCamera.connect = connect
+    camera_opencv.OpenCVCamera.disconnect = disconnect
+    camera_opencv.OpenCVCamera.read = lambda self: _read_black_or_live(original_read, self)
+    camera_opencv.OpenCVCamera.async_read = lambda self, timeout_ms=200: _read_black_or_live(
+        original_async_read, self, timeout_ms
+    )
+    camera_opencv.OpenCVCamera.read_latest = lambda self, max_age_ms=500: _read_black_or_live(
+        original_read_latest, self, max_age_ms
+    )
+
+    from .esp32_udp_camera import Esp32UdpCamera
+
+    original_udp_connect = Esp32UdpCamera.connect
+    original_udp_disconnect = Esp32UdpCamera.disconnect
+    original_udp_read = Esp32UdpCamera.read
+    original_udp_read_latest = Esp32UdpCamera.read_latest
+    original_udp_is_connected = Esp32UdpCamera.is_connected.fget
+
+    def udp_is_connected(self) -> bool:
+        if getattr(self, "_sarm_black_fallback", False):
+            return True
+        return original_udp_is_connected(self)
+
+    def udp_connect(self, warmup: bool = True) -> None:
+        if getattr(self, "_sarm_black_fallback", False):
+            return
+        try:
+            original_udp_connect(self, warmup=warmup)
+        except Exception as exc:
+            _enable_black_fallback(self, exc)
+
+    def udp_disconnect(self) -> None:
+        if getattr(self, "_sarm_black_fallback", False):
+            self._sarm_black_fallback = False
+            return
+        original_udp_disconnect(self)
+
+    Esp32UdpCamera.is_connected = property(udp_is_connected)
+    Esp32UdpCamera.connect = udp_connect
+    Esp32UdpCamera.disconnect = udp_disconnect
+    Esp32UdpCamera.read = lambda self: _read_black_or_live(original_udp_read, self)
+    Esp32UdpCamera.read_latest = lambda self, max_age_ms=500: _read_black_or_live(
+        original_udp_read_latest, self, max_age_ms
+    )
+
+    _RESILIENT_CAMERA_PATCHED = True
+
+
+def install_udp_camera_patch() -> None:
+    """Route esp32udp: sources to Esp32UdpCamera instead of OpenCV VideoCapture."""
+    global _UDP_CAMERA_PATCHED
+    if _UDP_CAMERA_PATCHED:
+        return
+
+    import lerobot.cameras.utils as cam_utils
+    from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
+    from lerobot.robots.so_follower import so_follower as sf_module
+
+    from .esp32_udp_camera import Esp32UdpCamera, is_esp32_udp_source
+
+    original_make = cam_utils.make_cameras_from_configs
+
+    def make_cameras_from_configs(camera_configs):
+        cameras: dict[str, Any] = {}
+        passthrough: dict[str, Any] = {}
+        for key, cfg in camera_configs.items():
+            if cfg.type == "opencv" and is_esp32_udp_source(getattr(cfg, "index_or_path", "")):
+                cameras[key] = Esp32UdpCamera(cfg)
+            else:
+                passthrough[key] = cfg
+        if passthrough:
+            cameras.update(original_make(passthrough))
+        return cameras
+
+    patched_make = make_cameras_from_configs
+    cam_utils.make_cameras_from_configs = patched_make
+    sf_module.make_cameras_from_configs = patched_make
+
+    if getattr(OpenCVCamera, "_sarm_udp_delegate_patched", False):
+        _UDP_CAMERA_PATCHED = True
+        return
+
+    original_connect = OpenCVCamera.connect
+    original_disconnect = OpenCVCamera.disconnect
+    original_is_connected = OpenCVCamera.is_connected.fget
+    original_read = OpenCVCamera.read
+    original_read_latest = OpenCVCamera.read_latest
+
+    def _udp_delegate(self) -> Esp32UdpCamera:
+        delegate = getattr(self, "_esp32_udp_delegate", None)
+        if delegate is None:
+            delegate = Esp32UdpCamera(self.config)
+            self._esp32_udp_delegate = delegate
+        return delegate
+
+    def _uses_udp(self) -> bool:
+        return is_esp32_udp_source(str(getattr(self, "index_or_path", "")))
+
+    def opencv_connect(self, warmup: bool = True) -> None:
+        if _uses_udp(self):
+            _udp_delegate(self).connect(warmup=warmup)
+            self._sarm_udp_active = True
+            return
+        return original_connect(self, warmup=warmup)
+
+    def opencv_disconnect(self) -> None:
+        if getattr(self, "_sarm_udp_active", False):
+            _udp_delegate(self).disconnect()
+            self._sarm_udp_active = False
+            return
+        return original_disconnect(self)
+
+    def opencv_is_connected(self) -> bool:
+        if getattr(self, "_sarm_udp_active", False):
+            return _udp_delegate(self).is_connected
+        return original_is_connected(self)
+
+    def opencv_read(self) -> Any:
+        if getattr(self, "_sarm_udp_active", False):
+            return _udp_delegate(self).read()
+        return original_read(self)
+
+    def opencv_read_latest(self, max_age_ms: int = 500) -> Any:
+        if getattr(self, "_sarm_udp_active", False):
+            return _udp_delegate(self).read_latest(max_age_ms=max_age_ms)
+        return original_read_latest(self, max_age_ms=max_age_ms)
+
+    OpenCVCamera.connect = opencv_connect
+    OpenCVCamera.disconnect = opencv_disconnect
+    OpenCVCamera.is_connected = property(opencv_is_connected)
+    OpenCVCamera.read = opencv_read
+    OpenCVCamera.read_latest = opencv_read_latest
+    OpenCVCamera._sarm_udp_delegate_patched = True
+
+    _UDP_CAMERA_PATCHED = True
+
+
+def build_camera_from_config(cam: CameraSettings):
+    """Instantiate a LeRobot Camera (USB, HTTP, or ESP32 UDP) from project settings."""
+    install_udp_camera_patch()
+    install_stream_camera_patch()
+    install_usb_downscale_patch()
+    from lerobot.cameras.utils import make_cameras_from_configs
+
+    config = build_lerobot_camera_config(cam)
+    return make_cameras_from_configs({"_preview": config})["_preview"]
+
+
+def install_all_camera_patches() -> None:
+    """Install stream, UDP, downscale, resilient, and follower-connect camera patches."""
+    install_udp_camera_patch()
+    install_stream_camera_patch()
+    install_usb_downscale_patch()
+    install_resilient_camera_patch()
+    install_follower_connect_patch()
+
+
+def install_follower_connect_patch() -> None:
+    """Connect USB cameras before the servo bus (macOS warmup + stagger)."""
+    global _FOLLOWER_CONNECT_PATCHED
+    if _FOLLOWER_CONNECT_PATCHED:
+        return
+
+    from lerobot.robots.so_follower import so_follower as sf
+    from lerobot.utils.errors import DeviceAlreadyConnectedError
+
+    def _patched_connect(original_connect):
+        def connect(self, calibrate: bool = True) -> None:
+            if self.is_connected:
+                raise DeviceAlreadyConnectedError(f"{self} already connected")
+            if self.cameras:
+                connect_follower_robot(self, calibrate=calibrate)
+                return
+            original_connect(self, calibrate=calibrate)
+
+        return connect
+
+    for cls in (sf.SO100Follower, sf.SO101Follower):
+        cls.connect = _patched_connect(cls.connect)
+    _FOLLOWER_CONNECT_PATCHED = True
+
+
+def require_working_cameras(cfg: ProjectConfig) -> None:
+    """Exit if any configured USB camera index cannot capture frames."""
+    issues = _configured_index_mismatches(cfg)
+    if not issues:
+        return
+    print("Camera config does not match working USB devices:", file=sys.stderr)
+    for line in issues:
+        print(f"  - {line}", file=sys.stderr)
+    print(
+        "\nRun:  sarm-hand list-cameras\n"
+        "Update index_or_path in config/default.yaml to indices with captures: yes.\n"
+        "Remove broken cameras from config until hardware is fixed.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def connect_usb_cameras(
+    cameras: dict[str, Any],
+    *,
+    stagger_s: float | None = None,
+    retries: int = 2,
+    fallback_black: bool = True,
+) -> None:
+    """Open USB cameras with staggered connect (macOS multi-cam is flaky back-to-back)."""
+    if not cameras:
+        return
+
+    prepare_opencv_platform()
+    if fallback_black:
+        install_all_camera_patches()
+    else:
+        install_stream_camera_patch()
+        install_usb_downscale_patch()
+
+    gap = stagger_s if stagger_s is not None else (1.5 if platform.system() == "Darwin" else 0.25)
+    names = list(cameras.keys())
+    for i, name in enumerate(names):
+        if i > 0 and gap > 0:
+            time.sleep(gap)
+        cam = cameras[name]
+        from .esp32_udp_camera import is_esp32_udp_source
+
+        is_udp = is_esp32_udp_source(str(getattr(cam, "index_or_path", "")))
+        cam_retries = max(retries, 4) if is_udp else retries
+        last_exc: Exception | None = None
+        for attempt in range(max(1, cam_retries)):
+            try:
+                cam.connect()
+                if getattr(cam, "_sarm_black_fallback", False):
+                    print(f"  {name}: black frames (configured index unavailable)")
+                last_exc = None
+                break
+            except (ConnectionError, TimeoutError, RuntimeError) as exc:
+                last_exc = exc
+                if cam.is_connected:
+                    cam.disconnect()
+                if attempt + 1 < cam_retries:
+                    time.sleep(gap if not is_udp else max(gap, 1.0))
+        if last_exc is not None:
+            if fallback_black:
+                _enable_black_fallback(cam, last_exc, label=name)
+            else:
+                raise ConnectionError(f"Camera '{name}' failed to connect: {last_exc}") from last_exc
+
+
+def prepare_opencv_platform() -> None:
+    """macOS: prefer AVFoundation and avoid FFmpeg device enumeration (conflicts with PyAV)."""
+    if platform.system() != "Darwin":
+        return
+    os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_LIST", "AVFOUNDATION")
+
+
+def connect_follower_robot(robot: Any, *, calibrate: bool = False) -> None:
+    """Connect follower arm: cameras first, then servo bus (avoids bus timeout during cam warmup)."""
+    from .robot import ensure_bus_calibration
+
+    if robot.cameras:
+        print(f"Connecting {len(robot.cameras)} camera(s)...")
+        connect_usb_cameras(robot.cameras)
+    robot.bus.connect()
+    if not robot.is_calibrated and calibrate:
+        robot.calibrate()
+    elif not robot.is_calibrated:
+        ensure_bus_calibration(robot, "follower")
+    robot.configure()
 
 
 def build_robot_camera_configs(cfg: ProjectConfig) -> dict:
     """Build LeRobot camera configs keyed by name (for teleop / recording)."""
-    return {name: build_lerobot_camera_config(cam) for name, cam in cfg.cameras.items()}
+    from dataclasses import replace
+
+    multi = len(cfg.cameras) > 1
+    configs = {}
+    for name, cam in cfg.cameras.items():
+        config = build_lerobot_camera_config(cam)
+        if multi and platform.system() == "Darwin" and config.warmup_s < 3:
+            config = replace(config, warmup_s=3)
+        configs[name] = config
+    return configs
 
 
 def cameras_lerobot_dict(cfg: ProjectConfig) -> dict[str, dict[str, Any]]:
@@ -357,17 +940,26 @@ def cameras_lerobot_dict(cfg: ProjectConfig) -> dict[str, dict[str, Any]]:
 
 def describe_camera(name: str, cam: CameraSettings) -> str:
     source = resolve_camera_source(cam)
-    kind = "stream" if is_stream_camera(cam) else "usb"
-    effective = effective_camera_settings(cam)
+    if is_udp_camera(cam):
+        kind = "esp32-udp"
+    elif is_stream_camera(cam):
+        kind = "stream"
+    else:
+        kind = "usb"
     parts = [f"{name}: {kind} ({cam.type})", f"source={source!r}"]
-    if effective.auto_resolution:
+    if _wants_downscale(cam):
+        parts.append(f"{cam.width}x{cam.height} (downscale from native)")
+    elif cam.auto_resolution:
         parts.append("auto_resolution")
-    elif effective.width and effective.height:
-        parts.append(f"{effective.width}x{effective.height}")
-    if effective.fps:
-        parts.append(f"@{effective.fps}fps")
+    elif cam.width and cam.height:
+        parts.append(f"{cam.width}x{cam.height}")
+    if cam.fps and not _wants_downscale(cam):
+        parts.append(f"@{cam.fps}fps")
     if is_stream_camera(cam):
         parts.append("(native at connect)")
+    if is_udp_camera(cam):
+        host, port = resolve_udp_endpoint(cam)
+        parts.append(f"udp→{host}:{port} (jpeg decode on host)")
     return " ".join(parts)
 
 
@@ -394,14 +986,12 @@ def _camera_failure_hints(settings: CameraSettings) -> str:
 
 
 def _read_one_frame(settings: CameraSettings):
-    """Connect via LeRobot and return one RGB frame."""
+    """Connect and return one RGB frame."""
     import logging
-
-    from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 
     logging.getLogger("lerobot.cameras.opencv.camera_opencv").setLevel(logging.ERROR)
 
-    camera = OpenCVCamera(build_lerobot_camera_config(settings))
+    camera = build_camera_from_config(settings)
     try:
         with _quiet_opencv():
             camera.connect()
@@ -456,9 +1046,8 @@ def preview_camera(
     seconds: float = 5.0,
     show_window: bool = True,
 ) -> None:
-    """Capture frames from a USB camera or HTTP stream."""
+    """Capture frames from a USB camera, HTTP stream, or ESP32 UDP JPEG."""
     import cv2
-    from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 
     try:
         settings = _settings_from_cli(
@@ -468,8 +1057,8 @@ def preview_camera(
         print(exc, file=sys.stderr)
         sys.exit(1)
 
-    config = build_lerobot_camera_config(settings)
-    camera = OpenCVCamera(config)
+    install_all_camera_patches()
+    camera = build_camera_from_config(settings)
 
     print(describe_camera(name or "preview", settings))
     print("Connecting...")
@@ -484,6 +1073,16 @@ def preview_camera(
                 "  - Confirm the URL opens in a browser or VLC",
                 "  - For MJPEG, try appending /video or /shot.jpg per your camera docs",
                 "  - Set width/height/fps to null in config for auto-detected stream size",
+                sep="\n",
+                file=sys.stderr,
+            )
+        if is_udp_camera(settings):
+            host, port = resolve_udp_endpoint(settings)
+            print(
+                f"\nESP32 UDP tips:",
+                f"  - ESP32 must be running udp_stream firmware on {host}:{port}",
+                "  - Mac listens on a random local UDP port and sends SUBSCRIBE packets",
+                "  - Ensure Mac and ESP32 are on the same Wi‑Fi network",
                 sep="\n",
                 file=sys.stderr,
             )
@@ -519,22 +1118,53 @@ def preview_camera(
     print(f"Captured {frame_count} frame(s)")
 
 
+def _configured_index_mismatches(cfg: ProjectConfig) -> list[str]:
+    """Warn when a USB camera index is missing or does not capture frames."""
+    working = working_usb_camera_ids()
+    if not working:
+        return []
+    issues: list[str] = []
+    working_ids = {str(i) for i in working}
+    for name, cam in cfg.cameras.items():
+        if is_stream_camera(cam) or is_udp_camera(cam):
+            continue
+        source = resolve_camera_source(cam)
+        if isinstance(source, int):
+            if str(source) not in working_ids:
+                ids = ", ".join(str(i) for i in working)
+                issues.append(
+                    f"{name}: index {source} not usable — working indices: {ids}"
+                )
+    return issues
+
+
 def test_configured_cameras() -> None:
     """Connect to each camera in config/default.yaml and grab one frame."""
+    install_all_camera_patches()
+    prepare_opencv_platform()
     cfg = ProjectConfig.load()
     if not cfg.cameras:
         print("No cameras configured in config/default.yaml")
         sys.exit(1)
+
+    mismatches = _configured_index_mismatches(cfg)
+    if mismatches:
+        print("Index mismatch (run list-cameras to verify):")
+        for line in mismatches:
+            print(f"  - {line}")
+        print()
 
     print(f"Testing {len(cfg.cameras)} configured camera(s)...\n")
     failed = False
 
     for name, settings in cfg.cameras.items():
         print(describe_camera(name, settings))
-        attempts: list[tuple[str, CameraSettings]] = [
-            ("configured", effective_camera_settings(settings)),
-        ]
-        if not settings.auto_resolution and not is_stream_camera(settings):
+        attempts: list[tuple[str, CameraSettings]] = [("configured", settings)]
+        if (
+            not settings.auto_resolution
+            and not is_stream_camera(settings)
+            and not _wants_downscale(settings)
+        ):
             auto = replace(settings, auto_resolution=True, width=None, height=None, fps=None)
             attempts.append(("auto_resolution", effective_camera_settings(auto)))
 
@@ -543,13 +1173,10 @@ def test_configured_cameras() -> None:
             try:
                 frame = _read_one_frame(attempt_settings)
                 h, w = frame.shape[:2]
-                if label != "configured":
-                    print(f"  OK ({label}) — frame {w}x{h}, {frame.dtype}")
-                    print(
-                        "  Tip: add auto_resolution: true to config for reliable capture\n"
-                    )
-                else:
-                    print(f"  OK — frame {w}x{h}, {frame.dtype}\n")
+                expected = (settings.height, settings.width)
+                if expected[0] and expected[1] and (h, w) != expected:
+                    raise RuntimeError(f"expected {expected[1]}x{expected[0]}, got {w}x{h}")
+                print(f"  OK{f' ({label})' if label != 'configured' else ''} — frame {w}x{h}, {frame.dtype}\n")
                 last_error = None
                 break
             except Exception as exc:

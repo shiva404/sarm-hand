@@ -6,12 +6,18 @@ from sarm_hand.config import ProjectConfig
 from sarm_hand.policy import _use_genesis_policy, build_policy_rename_map
 
 
-def test_build_policy_rename_map_genesis_defaults_front_to_camera1():
+def test_build_policy_rename_map_identity_from_cameras():
+    cfg = ProjectConfig.load()
+    mapping = build_policy_rename_map(cfg, genesis=False)
+    for name in cfg.cameras:
+        assert mapping[f"observation.images.{name}"] == f"observation.images.{name}"
+
+
+def test_build_policy_rename_map_genesis_identity_from_cameras():
     cfg = ProjectConfig.load()
     mapping = build_policy_rename_map(cfg, genesis=True)
-    if cfg.genesis.cameras:
-        first = next(iter(cfg.genesis.cameras))
-        assert mapping == {f"observation.images.{first}": "observation.images.camera1"}
+    for name in cfg.genesis.cameras:
+        assert mapping[f"observation.images.{name}"] == f"observation.images.{name}"
 
 
 def test_use_genesis_policy_flag_and_backend():

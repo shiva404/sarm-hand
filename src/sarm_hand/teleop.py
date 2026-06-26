@@ -11,7 +11,7 @@ from .calibration_bridge import (
     remap_leader_action_to_follower,
     require_teleop_calibrations,
 )
-from .cameras import build_robot_camera_configs
+from .cameras import build_robot_camera_configs, connect_follower_robot
 from .config import ProjectConfig
 from .rerun_viz import init_leader_teleop_rerun, leader_teleop_loop
 from .robot import (
@@ -29,6 +29,9 @@ def teleop_leader(
     with_cameras: bool = False,
 ) -> None:
     """Teleoperate S-ARM101 follower with a matching leader arm via USB."""
+    from .cameras import install_all_camera_patches
+
+    install_all_camera_patches()
     import rerun as rr
     from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower
@@ -69,6 +72,11 @@ def teleop_leader(
     if with_cameras and not cfg.cameras:
         print("No cameras configured in config/default.yaml — continuing without.", file=sys.stderr)
 
+    if with_cameras and cfg.cameras:
+        from .cameras import prepare_opencv_platform
+
+        prepare_opencv_platform()
+
     robot_cfg = SOFollowerRobotConfig(
         id=cfg.robot.id,
         port=follower_port,
@@ -85,9 +93,17 @@ def teleop_leader(
 
     init_logging()
     if display_data:
-        init_leader_teleop_rerun(session_name="teleoperation", with_cameras=with_cameras)
+        camera_names = list(cfg.cameras) if with_cameras and cfg.cameras else None
+        init_leader_teleop_rerun(
+            session_name="teleoperation",
+            with_cameras=with_cameras,
+            camera_names=camera_names,
+        )
         print("Rerun: follower/leader joint graphs should open automatically.")
-        print("  Timeline: step  |  Entities: motors/follower/*, motors/leader/*")
+        if camera_names:
+            print(f"  Cameras: {', '.join(camera_names)}  |  Timeline: step")
+        else:
+            print("  Timeline: step  |  Entities: motors/follower/*, motors/leader/*")
 
     robot = SO101Follower(robot_cfg)
     teleop = SO101Leader(leader_cfg)
@@ -98,28 +114,46 @@ def teleop_leader(
     print("Starting teleoperation (Ctrl+C to stop)...")
     try:
         with _motor_write_retries():
+            if with_cameras and robot.cameras:
+                connect_follower_robot(robot, calibrate=False)
+            else:
+                robot.connect(calibrate=False)
             teleop.connect()
-            robot.connect()
         leader_teleop_loop(
             teleop=teleop,
             robot=robot,
-            fps=60,
+            fps=cfg.teleop.control_fps,
             display_data=display_data,
             duration=None,
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
             remap_action=_remap,
+            camera_names=list(cfg.cameras) if with_cameras and cfg.cameras else None,
+            action_smoothing=cfg.teleop.action_smoothing,
         )
-    except ConnectionError as exc:
-        print(
-            "\nLost contact with a servo while connecting the follower or leader.\n"
-            "This is usually a loose daisy-chain cable or insufficient 12V power.\n"
-            "\n  sarm-hand test-motors --role follower\n"
-            "  sarm-hand test-motors --role leader\n"
-            "\nReseat the 3-pin cable at the joint mentioned in the error, then retry.",
-            file=sys.stderr,
-        )
+    except (ConnectionError, TimeoutError) as exc:
+        err = str(exc).lower()
+        if "camera" in err or "opencv" in err or isinstance(exc, TimeoutError):
+            print(
+                "\nFailed to connect a USB camera.\n"
+                "  sarm-hand list-cameras\n"
+                "  sarm-hand camera-test\n"
+                "\nTips:"
+                "\n  - Close FaceTime/Zoom; allow Camera access for Terminal"
+                "\n  - Unplug/replug cameras; verify index_or_path in config/default.yaml"
+                "\n  - Try teleop without cameras first: sarm-hand teleop-leader",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\nLost contact with a servo while connecting the follower or leader.\n"
+                "This is usually a loose daisy-chain cable or insufficient 12V power.\n"
+                "\n  sarm-hand test-motors --role follower\n"
+                "  sarm-hand test-motors --role leader\n"
+                "\nReseat the 3-pin cable at the joint mentioned in the error, then retry.",
+                file=sys.stderr,
+            )
         raise SystemExit(1) from exc
     except KeyboardInterrupt:
         pass

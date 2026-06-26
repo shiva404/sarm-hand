@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -271,33 +272,44 @@ class QuestSettings:
 class TeleopSettings:
     leader: LeaderSettings = field(default_factory=LeaderSettings)
     quest: QuestSettings = field(default_factory=QuestSettings)
+    # Follower command rate for teleop-leader / record-leader (independent of dataset.fps).
+    control_fps: int = 30
+    # Leader→follower EMA blend per control tick (1.0 = instant, lower = smoother).
+    action_smoothing: float = 1.0
 
 
 @dataclass
 class CameraSettings:
-    """USB camera (opencv/usb) or network stream (http/rtsp).
+    """USB camera (opencv/usb), network stream (http/rtsp), or ESP32 UDP JPEG (udp).
 
     USB examples:
       type: opencv, index_or_path: 0
-      type: opencv, index_or_path: /dev/video0
 
     HTTP/RTSP examples:
       type: http, url: http://192.168.1.100:8080/video
-      type: rtsp, url: rtsp://192.168.1.100:554/stream
 
-    For streams, omit width/height/fps (null) to use the source's native resolution.
-    On macOS, set auto_resolution: true — built-in cameras often fail at 640x480@30.
+    ESP32-CAM raw UDP (chunked JPEG, decoded on host):
+      type: udp, host: 192.168.0.58, port: 82
+
+    On macOS USB cameras that reject 640x480, set auto_resolution: true and keep
+    width/height as the output size — frames are captured natively then downscaled.
     """
 
     type: str = "opencv"
     index_or_path: int | str = 0
     url: str | None = None
+    host: str | None = None
+    port: int | None = 82
     auto_resolution: bool = False
     width: int | None = 640
     height: int | None = 480
     fps: int | None = 30
     warmup_s: int | None = None
-    # HTTP/RTSP: max age for read_latest() (ms). Default scales with fps (~15 frame periods).
+    rotate_180: bool = True
+    flip_horizontal: bool = True
+    stale_sec: float = 0.6
+    connect_grace_s: float = 10.0
+    fps_window: int = 5
     max_frame_age_ms: int | None = None
     fourcc: str | None = None
 
@@ -312,6 +324,15 @@ class DatasetSettings:
     episode_time_s: int = 60
     reset_time_s: int = 10
     push_to_hub: bool = False
+    # LeRobot dataset writer — keep video on for SmolVLA / training.
+    video: bool = True
+    streaming_encoding: bool = False
+    vcodec: str = "auto"
+    num_image_writer_threads_per_camera: int = 4
+    video_encoding_batch_size: int = 1
+    encoder_threads: int | None = 2
+    # Live Rerun preview during record-leader (off by default — 3 cameras exceed Rerun memory).
+    display_rerun: bool = False
 
 
 @dataclass
@@ -330,9 +351,9 @@ class PolicySettings:
     device: str | None = None  # cuda, mps, cpu — auto-detect if null
     episode_time_s: int = 60
     control_fps: int = 10  # inference/record loop rate; 5–10 for HTTP cameras
-    # Map robot camera names → SmolVLA names (smolvla_base expects camera1/2/3)
-    camera_map: dict[str, str] = field(default_factory=lambda: {"front": "camera1"})
-    empty_cameras: int | None = 2  # pad missing camera2/3 when using one physical camera
+    # Optional rename robot camera → policy image key. Empty = use cameras: names as-is.
+    camera_map: dict[str, str] = field(default_factory=dict)
+    empty_cameras: int | None = None  # pad missing SmolVLA slots (auto when fewer than 3 cams)
     # smolvla_base stores stats under so100.buffer.* — remap for SO-101 inference
     stats_buffer: str = "so100.buffer"
     train_dataset: str | None = None
@@ -482,6 +503,8 @@ class ProjectConfig:
         teleop = TeleopSettings(
             leader=LeaderSettings(**teleop_raw.get("leader", {})),
             quest=QuestSettings(**teleop_raw.get("quest", {})),
+            control_fps=int(teleop_raw.get("control_fps", 30)),
+            action_smoothing=float(teleop_raw.get("action_smoothing", 1.0)),
         )
         cameras = {
             name: CameraSettings(**cam_cfg)
@@ -549,6 +572,39 @@ class ProjectConfig:
         if not root.is_absolute():
             root = PROJECT_ROOT / root
         return root
+
+    def resolve_dataset_path(self, repo_id: str | None = None) -> Path:
+        """Full on-disk path for a LeRobot dataset (``root/local/name``)."""
+        rid = repo_id or self.dataset.repo_id
+        return self.resolve_dataset_root() / Path(*rid.split("/"))
+
+    @staticmethod
+    def session_repo_id(base_repo_id: str, when: datetime | None = None) -> str:
+        """Append record-sim style timestamp to the last repo_id segment."""
+        from .dataset_session import recording_stamp
+
+        stamp = recording_stamp(when)
+        parts = base_repo_id.split("/")
+        parts[-1] = f"{parts[-1]}-{stamp}"
+        return "/".join(parts)
+
+    def resolve_session_dataset_path(
+        self,
+        repo_id: str | None = None,
+        when: datetime | None = None,
+    ) -> tuple[str, Path]:
+        """Unique repo_id and path (same layout as record-sim timestamped sessions)."""
+        from .dataset_session import resolve_recording_paths
+
+        base = repo_id or self.dataset.repo_id
+        return resolve_recording_paths(
+            base_repo=base,
+            root=self.resolve_dataset_root(),
+            repo_id=None,
+            resume=False,
+            timestamp=True,
+            when=when,
+        )
 
     def resolve_tasks_root(self) -> Path:
         root = Path(self.tasks.root)

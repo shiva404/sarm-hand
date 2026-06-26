@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sarm_hand.record_sim import resolve_recording_paths
+from sarm_hand.dataset_session import resolve_recording_paths
 
 
 def test_timestamped_path_is_unique(tmp_path: Path):

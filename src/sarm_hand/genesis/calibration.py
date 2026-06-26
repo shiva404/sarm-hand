@@ -3,28 +3,52 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from ..config import JOINT_NAMES, ProjectConfig
 
-_LEROBOT_CAL_ROOT = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration"
+_LEGACY_LEROBOT_CAL_ROOT = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration"
+
+
+def lerobot_calibration_root() -> Path:
+    """LeRobot calibration directory (respects HF_LEROBOT_HOME when set)."""
+    home = os.environ.get("HF_LEROBOT_HOME")
+    if home:
+        return Path(home).expanduser() / "calibration"
+    cal = os.environ.get("HF_LEROBOT_CALIBRATION")
+    if cal:
+        return Path(cal).expanduser()
+    return _LEGACY_LEROBOT_CAL_ROOT
 
 
 def calibration_path(role: str, cfg: ProjectConfig) -> Path:
     """Path to the saved LeRobot calibration JSON for follower or leader."""
+    root = lerobot_calibration_root()
     if role == "leader":
-        return _LEROBOT_CAL_ROOT / "teleoperators" / "so_leader" / f"{cfg.teleop.leader.id}.json"
-    return _LEROBOT_CAL_ROOT / "robots" / "so_follower" / f"{cfg.robot.id}.json"
+        return root / "teleoperators" / "so_leader" / f"{cfg.teleop.leader.id}.json"
+    return root / "robots" / "so_follower" / f"{cfg.robot.id}.json"
+
+
+def _legacy_calibration_path(role: str, cfg: ProjectConfig) -> Path:
+    if role == "leader":
+        return (
+            _LEGACY_LEROBOT_CAL_ROOT
+            / "teleoperators"
+            / "so_leader"
+            / f"{cfg.teleop.leader.id}.json"
+        )
+    return _LEGACY_LEROBOT_CAL_ROOT / "robots" / "so_follower" / f"{cfg.robot.id}.json"
 
 
 def load_calibration(role: str, cfg: ProjectConfig) -> dict[str, dict[str, Any]] | None:
-    path = calibration_path(role, cfg)
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text())
-    return {k: v for k, v in data.items() if k in JOINT_NAMES}
+    for path in (calibration_path(role, cfg), _legacy_calibration_path(role, cfg)):
+        if path.is_file():
+            data = json.loads(path.read_text())
+            return {k: v for k, v in data.items() if k in JOINT_NAMES}
+    return None
 
 
 def require_calibration(role: str, cfg: ProjectConfig) -> dict[str, dict[str, Any]]:

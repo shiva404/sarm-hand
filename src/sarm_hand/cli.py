@@ -10,7 +10,7 @@ from . import __version__
 from .calibration_bridge import run_sync_calibration
 from .cameras import describe_camera, list_usb_cameras, preview_camera, test_configured_cameras
 from .config import JOINT_NAMES, ProjectConfig, parse_initial_ids
-from .data import dataset_export_episode, dataset_info, dataset_push, dataset_sample
+from .data import dataset_export_episode, dataset_info, dataset_list, dataset_push, dataset_sample
 from .joint_signal_log import run_joint_signal_log
 from .lelab_ui import (
     install_lelab,
@@ -195,7 +195,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo-id", default=None)
     p.add_argument("--num-episodes", type=int, default=None)
     p.add_argument("--single-task", default=None)
+    p.add_argument("--episode-time-s", type=float, default=None, help="Max seconds per episode")
+    p.add_argument("--reset-time-s", type=float, default=None, help="Seconds between episodes (not saved)")
     p.add_argument("--push-to-hub", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--rerun",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="display_rerun",
+        help="Live Rerun joint preview (default: off; cameras still saved to dataset videos/)",
+    )
 
     task_p = sub.add_parser(
         "task",
@@ -301,9 +310,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--device", default=None)
 
+    p = sub.add_parser("data-list", help="List local LeRobot recording sessions")
     p = sub.add_parser("data-info", help="Show dataset metadata")
     p.add_argument("--repo-id", default=None)
     p.add_argument("--root", default=None)
+    p.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the most recent record-leader session (default when --repo-id omitted)",
+    )
 
     p = sub.add_parser("data-sample", help="Print one dataset frame summary")
     p.add_argument("--repo-id", default=None)
@@ -316,9 +331,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--output-dir", default="data/exports")
 
-    p = sub.add_parser("data-push", help="Upload dataset to Hugging Face Hub")
+    p = sub.add_parser("data-push", help="Upload local dataset to Hugging Face Hub")
     p.add_argument("--repo-id", default=None)
     p.add_argument("--root", default=None)
+    p.add_argument(
+        "--push-to-hub",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Required to upload (default: dataset.push_to_hub in config, usually false)",
+    )
 
     p = sub.add_parser("lelab", help="Launch LeLab web UI (datasets, 3D teleop, training)")
     p.add_argument("--install", action="store_true", help="Install LeLab via uv tool")
@@ -474,7 +495,7 @@ def _show_config() -> None:
     print(f"Robot:   {cfg.robot.type} backend={cfg.robot.backend} @ {cfg.robot.port or '(auto)'}")
     print(f"Leader:  {cfg.teleop.leader.type} @ {cfg.teleop.leader.port or '(auto)'}")
     print(f"Quest:   phosphobot on port {cfg.teleop.quest.port}")
-    print(f"Dataset: {cfg.dataset.repo_id} → {cfg.resolve_dataset_root()}")
+    print(f"Dataset: {cfg.dataset.repo_id} → {cfg.resolve_dataset_path()}")
     print(f"Policy:  {cfg.policy.path} (device={cfg.policy.device or 'auto'})")
     print(f"Genesis: scene={cfg.genesis.scene} backend={cfg.genesis.backend}")
     print(f"Twin:    {cfg.twin.sync_mode} @ {cfg.twin.rate_hz} Hz")
@@ -567,6 +588,9 @@ def main() -> None:
                 args.num_episodes,
                 args.single_task,
                 args.push_to_hub,
+                args.episode_time_s,
+                args.reset_time_s,
+                display_data=args.display_rerun,
             )
         case "task":
             match args.task_command:
@@ -637,14 +661,16 @@ def main() -> None:
                 batch_size=args.batch_size,
                 device=args.device,
             )
+        case "data-list":
+            dataset_list()
         case "data-info":
-            dataset_info(args.repo_id, args.root)
+            dataset_info(args.repo_id, args.root, latest=args.latest or args.repo_id is None)
         case "data-sample":
             dataset_sample(args.repo_id, args.root, args.index)
         case "data-export":
             dataset_export_episode(args.repo_id, args.root, args.episode, args.output_dir)
         case "data-push":
-            dataset_push(args.repo_id, args.root)
+            dataset_push(args.repo_id, args.root, push_to_hub=args.push_to_hub)
         case "lelab":
             if args.install:
                 install_lelab()
