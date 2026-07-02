@@ -127,6 +127,35 @@ def test_resolve_dataset_lookup_skips_empty_latest_session(tmp_path: Path) -> No
     assert resolved_path == good_path
 
 
+def test_resolve_training_dataset_skips_test_subsample_for_full_dataset(tmp_path: Path) -> None:
+    import json
+
+    from sarm_hand.data import resolve_training_dataset, write_latest_session_pointer
+
+    cfg = ProjectConfig.load()
+    cfg.dataset.root = str(tmp_path / "datasets")
+    root = cfg.resolve_dataset_root()
+
+    tiny_id = "local/test-subsample-ep0-fps10"
+    tiny_path = root / "local" / "test-subsample-ep0-fps10"
+    (tiny_path / "meta").mkdir(parents=True)
+    (tiny_path / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 1, "total_frames": 250, "fps": 10})
+    )
+
+    full_id = "local/sarm101-dataset-full"
+    full_path = root / "local" / "sarm101-dataset-full"
+    (full_path / "meta").mkdir(parents=True)
+    (full_path / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 20, "total_frames": 14539, "fps": 30})
+    )
+
+    write_latest_session_pointer(cfg, tiny_id, tiny_path)
+    resolved_id, resolved_path = resolve_training_dataset(cfg, require_frames=True)
+    assert resolved_id == full_id
+    assert resolved_path == full_path
+
+
 def test_leader_record_loop_imports_build_dataset_frame() -> None:
     import inspect
 

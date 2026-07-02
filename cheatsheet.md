@@ -12,11 +12,14 @@ Leader port: `/dev/tty.usbmodem5B140289771`
 ```bash
 uv sync
 uv sync --extra quest
-uv sync --extra smolvla          # hardware policy (transformers, etc.)
-uv sync --extra genesis          # Genesis sim only
-uv sync --extra sim-policy       # Genesis + SmolVLA (run-smolvla --genesis)
-# equivalent: uv sync --extra genesis --extra smolvla
-./scripts/fetch_so101_assets.sh
+uv sync --extra training          # ACT / LeRobot train (lerobot-train)
+uv sync --extra smolvla           # SmolVLA inference + fine-tune (transformers, etc.)
+uv sync --extra genesis           # Genesis sim only
+uv sync --extra sim-policy        # Genesis + SmolVLA (run-smolvla --genesis)
+# ACT on hardware:  uv sync --extra training
+# SmolVLA full:     uv sync --extra smolvla --extra training
+# Genesis + both:   uv sync --extra genesis --extra smolvla --extra training
+./scripts/fetch_so101_assets.sh   # Genesis / sim URDF assets
 ```
 
 ---
@@ -24,9 +27,111 @@ uv sync --extra sim-policy       # Genesis + SmolVLA (run-smolvla --genesis)
 ## Config & ports
 
 ```bash
-uv run sarm-hand config-show
+uv run sarm-hand config-show      # robot, cameras, policies.act / policies.smolvla, dataset
 uv run sarm-hand find-port
 ```
+
+---
+
+## Quick tests & debug (pre-flight)
+
+Run these before teleop, recording, or policy inference. Uses ports from config when `--port` is omitted.
+
+### One-shot “is everything ready?”
+
+```bash
+uv run sarm-hand find-port
+uv run sarm-hand config-show
+uv run sarm-hand test-motors --role follower
+uv run sarm-hand test-motors --role leader
+uv run sarm-hand test-poses --pose ready
+uv run sarm-hand leader-free
+uv run sarm-hand list-cameras
+uv run sarm-hand camera-test
+```
+
+### Motors & USB
+
+```bash
+# Bus scan — which servo IDs respond (no programming)
+uv run sarm-hand setup-motors --role follower --scan
+uv run sarm-hand setup-motors --role leader --scan
+
+# Ping each joint; extra retries if flaky cable
+uv run sarm-hand test-motors --role follower
+uv run sarm-hand test-motors --role leader --retries 5
+
+# Lost a servo mid-session? Re-seat daisy-chain, then re-test
+uv run sarm-hand test-motors --role follower --port /dev/tty.usbmodem5B141140091
+```
+
+### Poses — home / ready / park
+
+```bash
+uv run sarm-hand test-poses --list
+uv run sarm-hand test-poses --pose ready          # recording start pose
+uv run sarm-hand test-poses --pose home
+uv run sarm-hand test-poses --pose park           # safe shutdown pose
+uv run sarm-hand test-poses                       # full sequence + tolerance check
+```
+
+### Calibration quick fixes
+
+```bash
+# Leader stiff or follower won't mirror range — copy leader limits to follower
+uv run sarm-hand sync-calibration --from leader --to follower
+uv run sarm-hand sync-calibration --from leader --write-motors
+
+# Leader won't move by hand before teleop
+uv run sarm-hand leader-free
+
+# Full interactive cal (only when offsets are wrong)
+uv run sarm-hand calibrate --role follower
+uv run sarm-hand calibrate --role leader
+```
+
+### Cameras
+
+```bash
+uv run sarm-hand list-cameras                     # USB indices for config
+uv run sarm-hand camera-probe --name front        # find capture_width/height
+uv run sarm-hand camera-probe --name wrist
+uv run sarm-hand camera-probe --together          # all configured cams at once
+uv run sarm-hand camera-test                      # concurrent (same as record-leader)
+uv run sarm-hand camera-preview --name front --seconds 5
+uv run sarm-hand camera-preview --name wrist --seconds 5
+```
+
+### Teleop smoke test
+
+```bash
+uv run sarm-hand leader-free
+uv run sarm-hand teleop-leader --no-display-data  # quick mirror check, no Rerun
+# Ctrl+C when done
+```
+
+### After recording — did data land?
+
+```bash
+uv run sarm-hand data-list
+uv run sarm-hand data-info --latest               # shows session repo-id + frame count
+uv run sarm-hand data-sample --index 0
+uv run sarm-hand viz-dataset --repo-id <session-repo-id> --episode 0
+```
+
+### Common failures → try this
+
+
+| Symptom                    | Command                                                            |
+| -------------------------- | ------------------------------------------------------------------ |
+| Wrong USB port             | `find-port` then update `robot.port` / `teleop.leader.port`        |
+| Servo not responding       | `test-motors --role follower --retries 5`                          |
+| Leader stiff in teleop     | `leader-free`                                                      |
+| Follower range mismatch    | `sync-calibration --from leader --write-motors`                    |
+| Camera black / wrong index | `list-cameras` → `camera-probe --name front` → fix `index_or_path` |
+| Record fails on cameras    | `camera-test` (must pass concurrent test)                          |
+| Arm not at demo start pose | `test-poses --pose ready`                                          |
+
 
 ---
 
@@ -53,6 +158,10 @@ uv run sarm-hand setup-motors --role follower --port /dev/tty.usbmodem5B14114009
 # Interactive calibration
 uv run sarm-hand calibrate --role follower --port /dev/tty.usbmodem5B141140091
 uv run sarm-hand calibrate --role leader --port /dev/tty.usbmodem5B140289771
+
+# Copy leader travel ranges onto follower (keeps each arm's homing offsets)
+uv run sarm-hand sync-calibration --from leader --to follower
+uv run sarm-hand sync-calibration --from leader --write-motors   # flash to follower EEPROM
 
 # Ping / read / torque test each joint
 uv run sarm-hand test-motors --role follower --port /dev/tty.usbmodem5B141140091
@@ -89,21 +198,33 @@ uv run sarm-hand test-poses --port /dev/tty.usbmodem5B141140091 --tolerance 10
 
 ## Cameras
 
+Default setup: **front + wrist** USB cameras (`cameras.front`, `cameras.wrist` in config).  
+Run probe + concurrent test before recording — same code path as `record-leader`.
+
 ```bash
 uv run sarm-hand list-cameras
-uv run sarm-hand camera-test
 
-# USB camera index 0
+# Probe supported capture resolutions (set capture_width/height in config)
+uv run sarm-hand camera-probe --name front
+uv run sarm-hand camera-probe --name wrist
+uv run sarm-hand camera-probe --all-usb
+uv run sarm-hand camera-probe --together          # all configured USB cams open at once
+
+# Test configured cameras (concurrent when 2+ in config — matches record-leader)
+uv run sarm-hand camera-test
+uv run sarm-hand camera-test --each               # sequential only
+uv run sarm-hand camera-test --together           # force concurrent
+
+# Live preview
+uv run sarm-hand camera-preview --name front --seconds 10
+uv run sarm-hand camera-preview --name wrist --seconds 10
 uv run sarm-hand camera-preview --index 0 --seconds 10
 
-# Config camera named "front" (HTTP stream in default.yaml)
-uv run sarm-hand camera-preview --name front --seconds 10
-
-# Direct stream URL
+# HTTP / RTSP stream (if configured)
 uv run sarm-hand camera-preview --url http://192.168.0.58:81/stream --seconds 10
 
 # Headless snapshot
-uv run sarm-hand camera-preview --url http://192.168.0.58:81/stream --no-window --output /tmp/front.jpg
+uv run sarm-hand camera-preview --name front --no-window --output /tmp/front.jpg
 ```
 
 ---
@@ -173,6 +294,8 @@ uv run sarm-hand task info --task-slug pick_and_place_the_object --demo latest
 
 ## Data collection (LeRobot datasets)
 
+During `record-leader`: **→ Right arrow** or **s** = save episode early; **r** = discard and re-record; **Esc** = quit session.
+
 ```bash
 # Leader-follower recording (uses config ports, cameras, dataset settings)
 uv run sarm-hand record-leader
@@ -185,6 +308,14 @@ uv run sarm-hand record-leader \
   --num-episodes 50 \
   --single-task "Pick and place the object"
 
+# Episode timing overrides
+uv run sarm-hand record-leader \
+  --episode-time-s 45 \
+  --reset-time-s 15
+
+# Live Rerun preview during recording (off by default — saves memory)
+uv run sarm-hand record-leader --rerun
+
 # Upload to Hugging Face after recording
 uv run sarm-hand record-leader \
   --repo-id local/sarm101-dataset \
@@ -194,7 +325,7 @@ uv run sarm-hand record-leader \
 # Quest 2 recording instructions
 uv run sarm-hand record-quest --repo-id local/sarm101-quest-demos
 
-# Record policy evaluation rollouts
+# Record policy evaluation rollouts (SmolVLA — needs --task)
 uv run sarm-hand record-policy \
   --follower-port /dev/tty.usbmodem5B141140091 \
   --policy-path outputs/train/sarm101_smolvla \
@@ -205,7 +336,66 @@ uv run sarm-hand record-policy \
 
 ---
 
+## ACT policy (front + wrist — recommended)
+
+Config: `policies.act` in `config/default.yaml`. Training needs `uv sync --extra training`.
+
+```bash
+# 1. Verify cameras, then record demos
+uv run sarm-hand camera-test
+uv run sarm-hand test-poses --pose ready
+
+# Record N episodes (default N=50 from dataset.num_episodes in config)
+uv run sarm-hand record-leader --num-episodes 50
+
+# Or set count only on CLI; other defaults from config:
+uv run sarm-hand record-leader \
+  --num-episodes 20 \
+  --single-task "Pick and place the object" \
+  --episode-time-s 25 \
+  --reset-time-s 10
+
+# Omit --num-episodes to use dataset.num_episodes in config/default.yaml (50)
+uv run sarm-hand record-leader
+
+# During recording: → or s = save episode early; r = discard & re-record; Esc = stop
+# After session: verify count
+uv run sarm-hand data-info --latest
+```
+
+# 2. Train (defaults: outputs/train/sarm101_act, 50k steps)
+
+uv run sarm-hand train-act --device mps
+uv run sarm-hand train-act   
+  --dataset-repo-id local/sarm101-dataset   
+  --output-dir outputs/train/sarm101_act   
+  --steps 5000   
+  --batch-size 8   
+  --device mps
+
+# Resume interrupted training
+
+uv run sarm-hand train-act --resume --device mps
+
+# 3. Run on hardware
+
+uv run sarm-hand run-act
+uv run sarm-hand run-act   
+  --policy-path outputs/train/sarm101_act   
+  --episode-time 60   
+  --device mps
+
+# Without Rerun
+
+uv run sarm-hand run-act --no-display-data
+
+```
+
+---
+
 ## SmolVLA policy
+
+Config: `policies.smolvla` in `config/default.yaml`. Needs `uv sync --extra smolvla` (and `--extra training` to fine-tune).
 
 ```bash
 # Run base model with language task
@@ -237,14 +427,17 @@ uv run sarm-hand run-smolvla \
 # Fine-tune on recorded dataset
 uv run sarm-hand train-smolvla --dataset-repo-id local/sarm101-dataset
 
-# Training with explicit settings (Apple Silicon)
+# Training with explicit settings (Apple Silicon — batch 4 avoids MPS OOM)
 uv run sarm-hand train-smolvla \
   --dataset-repo-id local/sarm101-dataset \
   --policy-path lerobot/smolvla_base \
   --output-dir outputs/train/sarm101_smolvla \
   --steps 20000 \
-  --batch-size 64 \
+  --batch-size 4 \
   --device mps
+
+# Resume interrupted training
+uv run sarm-hand train-smolvla --resume --device mps
 ```
 
 ---
@@ -252,9 +445,21 @@ uv run sarm-hand train-smolvla \
 ## Dataset tools
 
 ```bash
+# List timestamped recording sessions under dataset.root
+uv run sarm-hand data-list
+
+# Metadata (omit --repo-id to use latest session)
+uv run sarm-hand data-info --latest
 uv run sarm-hand data-info --repo-id local/sarm101-dataset
+
 uv run sarm-hand data-sample --repo-id local/sarm101-dataset --index 0
 uv run sarm-hand data-export --repo-id local/sarm101-dataset --episode 0 --output-dir data/exports
+
+# Downsample 30 fps recordings to 10 fps (no re-record; works on external datasets via --root)
+uv run sarm-hand data-subsample --latest --target-fps 10
+uv run sarm-hand data-subsample --repo-id local/sarm101-dataset --target-fps 10 --dry-run
+uv run sarm-hand data-subsample --root /path/to/external/dataset --repo-id user/dataset --target-fps 10
+
 uv run sarm-hand data-push --repo-id shiva404/sarm101-dataset
 
 # Local Rerun viewer for episode 0
@@ -268,7 +473,7 @@ uv run sarm-hand viz-dataset --hub --repo-id shiva404/sarm101-dataset
 
 ## 3D joint simulator (browser)
 
-Opens http://127.0.0.1:8763/sim/arm3d.html
+Opens [http://127.0.0.1:8763/sim/arm3d.html](http://127.0.0.1:8763/sim/arm3d.html)
 
 ```bash
 uv run sarm-hand sim
@@ -346,14 +551,14 @@ uv run sarm-hand lelab --dev
 uv run sarm-hand lelab --no-browser
 ```
 
-Opens http://localhost:8000
+Opens [http://localhost:8000](http://localhost:8000)
 
 ---
 
 ## First-time setup (full sequence)
 
 ```bash
-uv sync
+uv sync --extra training
 uv run sarm-hand find-port
 uv run sarm-hand setup-motors --role follower --port /dev/tty.usbmodem5B141140091 --scan
 uv run sarm-hand setup-motors --role follower --port /dev/tty.usbmodem5B141140091
@@ -362,21 +567,44 @@ uv run sarm-hand test-motors --role follower --port /dev/tty.usbmodem5B141140091
 uv run sarm-hand test-poses --port /dev/tty.usbmodem5B141140091
 uv run sarm-hand setup-motors --role leader --port /dev/tty.usbmodem5B140289771
 uv run sarm-hand calibrate --role leader --port /dev/tty.usbmodem5B140289771
+uv run sarm-hand sync-calibration --from leader --write-motors
 uv run sarm-hand leader-free --port /dev/tty.usbmodem5B140289771
+uv run sarm-hand list-cameras
+uv run sarm-hand camera-probe --together
+uv run sarm-hand camera-test
 uv run sarm-hand teleop-leader
+```
+
+---
+
+## ACT training workflow (quick)
+
+```bash
+uv sync --extra training
+uv run sarm-hand camera-test
+uv run sarm-hand record-leader --num-episodes 50
+uv run sarm-hand data-info --latest
+uv run sarm-hand train-act --device mps --steps 5000
+uv run sarm-hand run-act --policy-path outputs/train/sarm101_act
 ```
 
 ---
 
 ## Config reference
 
-| What | Where in config/default.yaml |
-|------|------------------------------|
-| Follower port | `robot.port` |
-| Leader port | `teleop.leader.port` |
-| Camera stream | `cameras.front.url` |
-| Dataset | `dataset.repo_id`, `dataset.root` |
-| Task demos | `tasks.root` → `data/tasks/` |
-| Genesis scene | `genesis.scene` → `pick_place_desk` |
-| Preset poses | `poses.home`, `poses.ready`, `poses.park` |
-| Motor IDs | `motors.follower`, `motors.leader` |
+
+| What                 | Where in config/default.yaml                                                      |
+| -------------------- | --------------------------------------------------------------------------------- |
+| Follower port        | `robot.port`                                                                      |
+| Leader port          | `teleop.leader.port`                                                              |
+| Cameras (ACT)        | `cameras.front`, `cameras.wrist` (`index_or_path`, `capture_*`, `width`/`height`) |
+| ACT policy           | `policies.act` → `output_dir`, `train_steps`, `control_fps`                       |
+| SmolVLA policy       | `policies.smolvla` → `path`, `output_dir`, `camera_map`, `stats_buffer`           |
+| Shared train dataset | `policies.train_dataset`                                                          |
+| Dataset              | `dataset.repo_id`, `dataset.root`, `dataset.fps`                                  |
+| Task demos           | `tasks.root` → `data/tasks/`                                                      |
+| Genesis scene        | `genesis.scene` → `pick_place_desk`                                               |
+| Preset poses         | `poses.home`, `poses.ready`, `poses.park`                                         |
+| Motor IDs            | `motors.follower`, `motors.leader`                                                |
+
+

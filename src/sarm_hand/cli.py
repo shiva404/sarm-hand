@@ -8,9 +8,22 @@ from pathlib import Path
 
 from . import __version__
 from .calibration_bridge import run_sync_calibration
-from .cameras import describe_camera, list_usb_cameras, preview_camera, test_configured_cameras
+from .cameras import (
+    describe_camera,
+    list_usb_cameras,
+    preview_camera,
+    probe_camera_resolutions,
+    test_configured_cameras,
+)
 from .config import JOINT_NAMES, ProjectConfig, parse_initial_ids
-from .data import dataset_export_episode, dataset_info, dataset_list, dataset_push, dataset_sample
+from .data import (
+    dataset_export_episode,
+    dataset_info,
+    dataset_list,
+    dataset_push,
+    dataset_sample,
+    dataset_subsample,
+)
 from .joint_signal_log import run_joint_signal_log
 from .lelab_ui import (
     install_lelab,
@@ -19,8 +32,8 @@ from .lelab_ui import (
     open_dataset_viz_hub,
     viz_dataset_local,
 )
-from .policy import run_smolvla, train_smolvla
-from .poses import test_poses
+from .policy import run_act, run_smolvla, train_act, train_smolvla
+from .poses import capture_pose, test_poses
 from .record import record_leader, record_policy, record_quest
 from .record_sim import record_sim, record_twin
 from .robot import (
@@ -65,7 +78,50 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not open a GUI window (use with --output for headless capture)",
     )
 
-    sub.add_parser("camera-test", help="Test all cameras defined in config/default.yaml")
+    p = sub.add_parser(
+        "camera-test",
+        help="Test configured cameras (concurrent when 2+ defined — same path as record-leader)",
+    )
+    p.add_argument(
+        "--each",
+        action="store_true",
+        help="Test cameras one at a time only (skip concurrent test)",
+    )
+    p.add_argument(
+        "--together",
+        action="store_true",
+        help="Force concurrent test (default when multiple cameras in config)",
+    )
+
+    p = sub.add_parser(
+        "camera-probe",
+        help="Probe supported USB capture resolutions (use before setting config sizes)",
+    )
+    p.add_argument("--index", type=int, default=None, help="USB camera index (e.g. 0)")
+    p.add_argument("--name", default=None, help="Configured camera name from config/default.yaml")
+    p.add_argument(
+        "--all-usb",
+        action="store_true",
+        help="Probe every USB camera OpenCV finds (ignore config names)",
+    )
+    p.add_argument(
+        "--together",
+        action="store_true",
+        help="After per-camera probe, test all configured USB cameras open at once",
+    )
+    p.add_argument(
+        "--output-width",
+        type=int,
+        default=640,
+        help="Target dataset output width for suggestions (default: 640)",
+    )
+    p.add_argument(
+        "--output-height",
+        type=int,
+        default=480,
+        help="Target dataset output height for suggestions (default: 480)",
+    )
+    p.add_argument("--fps", type=float, default=None, help="FPS to request during probe")
 
     p = sub.add_parser(
         "setup-motors",
@@ -174,6 +230,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--settle", type=float, default=0.5, help="Pause after each pose (seconds)")
     p.add_argument("--tolerance", type=float, default=8.0, help="Max joint error in normalized units")
     p.add_argument("--list", action="store_true", dest="list_poses", help="Show configured poses")
+
+    p = sub.add_parser(
+        "capture-pose",
+        help="Capture current leader/follower joint pose into config (rest → poses.ready)",
+    )
+    p.add_argument("--role", choices=["follower", "leader"], default="follower")
+    p.add_argument("--port", default=None)
+    p.add_argument(
+        "--name",
+        default="ready",
+        choices=["home", "ready", "park"],
+        help="Pose slot to update (default: ready = recording start)",
+    )
+    p.add_argument("--save", action="store_true", help="Write poses.<name> to config/default.yaml")
+    p.add_argument("--config", default=None, help="Config YAML path for --save")
 
     p = sub.add_parser("teleop-leader", help="Leader-follower teleoperation via USB")
     p.add_argument("--follower-port", default=None)
@@ -308,7 +379,52 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default=None)
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader workers (default: 0 on MPS/CPU, 4 on CUDA)",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue training from checkpoints in --output-dir",
+    )
     p.add_argument("--device", default=None)
+
+    p = sub.add_parser("train-act", help="Train ACT on a recorded dataset (front + wrist)")
+    p.add_argument("--dataset-repo-id", default=None)
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader workers (default: 0 on MPS/CPU, 4 on CUDA)",
+    )
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--device", default=None)
+    p.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="ACT optimizer LR (default: policies.act.learning_rate in config, 0.01)",
+    )
+
+    p = sub.add_parser(
+        "run-act",
+        help="Run fine-tuned ACT policy on the follower (front + wrist cameras)",
+    )
+    p.add_argument("--follower-port", default=None)
+    p.add_argument(
+        "--policy-path",
+        default=None,
+        help="Checkpoint dir or training output (default: outputs/train/sarm101_act)",
+    )
+    p.add_argument("--device", default=None)
+    p.add_argument("--episode-time", type=float, default=None, help="Seconds per episode")
+    p.add_argument("--display-data", action=argparse.BooleanOptionalAction, default=True)
 
     p = sub.add_parser("data-list", help="List local LeRobot recording sessions")
     p = sub.add_parser("data-info", help="Show dataset metadata")
@@ -330,6 +446,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root", default=None)
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--output-dir", default="data/exports")
+
+    p = sub.add_parser(
+        "data-subsample",
+        help="Downsample dataset fps (e.g. 30→10) without re-recording",
+    )
+    p.add_argument("--repo-id", default=None, help="Source dataset repo_id")
+    p.add_argument("--root", default=None, help="Source dataset directory (external imports)")
+    p.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the most recent record-leader session (default when --repo-id omitted)",
+    )
+    p.add_argument("--target-fps", type=int, default=10, help="Output fps (default: 10)")
+    p.add_argument("--output-repo-id", default=None, help="Output repo_id (default: <source>-fps<N>)")
+    p.add_argument("--output-root", default=None, help="Output directory (default: under dataset root)")
+    p.add_argument(
+        "--episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Only subsample these episode indices (default: all)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Print plan without writing")
 
     p = sub.add_parser("data-push", help="Upload local dataset to Hugging Face Hub")
     p.add_argument("--repo-id", default=None)
@@ -496,7 +635,22 @@ def _show_config() -> None:
     print(f"Leader:  {cfg.teleop.leader.type} @ {cfg.teleop.leader.port or '(auto)'}")
     print(f"Quest:   phosphobot on port {cfg.teleop.quest.port}")
     print(f"Dataset: {cfg.dataset.repo_id} → {cfg.resolve_dataset_path()}")
-    print(f"Policy:  {cfg.policy.path} (device={cfg.policy.device or 'auto'})")
+    print(
+        f"Camera:  fail_on_error={cfg.camera.fail_on_error} "
+        f"({'stop on error' if cfg.camera.fail_on_error else 'black-frame fallback'})"
+    )
+    act = cfg.policies.act
+    smolvla = cfg.policies.smolvla
+    steps_label = act.train_steps if act.train_steps is not None else f"auto×{act.train_epochs}ep"
+    print(
+        f"ACT:     {act.output_dir} "
+        f"(steps={steps_label}, record={cfg.dataset.num_episodes}×{cfg.dataset.episode_time_s}s, "
+        f"fps={act.control_fps}, device={act.device or 'auto'})"
+    )
+    print(
+        f"SmolVLA: {smolvla.path} → {smolvla.output_dir} "
+        f"(steps={smolvla.train_steps}, fps={smolvla.control_fps}, device={smolvla.device or 'auto'})"
+    )
     print(f"Genesis: scene={cfg.genesis.scene} backend={cfg.genesis.backend}")
     print(f"Twin:    {cfg.twin.sync_mode} @ {cfg.twin.rate_hz} Hz")
     print(f"Cameras: {list(cfg.cameras.keys()) or '(none)'}")
@@ -533,7 +687,17 @@ def main() -> None:
                 show_window=not args.no_window,
             )
         case "camera-test":
-            test_configured_cameras()
+            test_configured_cameras(together=args.together, each=args.each)
+        case "camera-probe":
+            probe_camera_resolutions(
+                index=args.index,
+                name=args.name,
+                all_usb=args.all_usb,
+                together=args.together,
+                output_width=args.output_width,
+                output_height=args.output_height,
+                fps=args.fps,
+            )
         case "setup-motors":
             try:
                 overrides = parse_initial_ids(args.initial_ids)
@@ -570,6 +734,14 @@ def main() -> None:
                 settle_s=args.settle,
                 tolerance=args.tolerance,
                 list_only=args.list_poses,
+            )
+        case "capture-pose":
+            capture_pose(
+                role=args.role,
+                name=args.name,
+                port=args.port,
+                save=args.save,
+                config_path=Path(args.config) if args.config else None,
             )
         case "teleop-leader":
             teleop_leader(
@@ -659,6 +831,27 @@ def main() -> None:
                 output_dir=args.output_dir,
                 steps=args.steps,
                 batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=args.device,
+                resume=args.resume,
+            )
+        case "train-act":
+            train_act(
+                args.dataset_repo_id,
+                output_dir=args.output_dir,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=args.device,
+                learning_rate=args.learning_rate,
+                resume=args.resume,
+            )
+        case "run-act":
+            run_act(
+                follower_port=args.follower_port,
+                policy_path=args.policy_path,
+                episode_time_s=args.episode_time,
+                display_data=args.display_data,
                 device=args.device,
             )
         case "data-list":
@@ -669,6 +862,17 @@ def main() -> None:
             dataset_sample(args.repo_id, args.root, args.index)
         case "data-export":
             dataset_export_episode(args.repo_id, args.root, args.episode, args.output_dir)
+        case "data-subsample":
+            dataset_subsample(
+                args.repo_id,
+                args.root,
+                target_fps=args.target_fps,
+                output_repo_id=args.output_repo_id,
+                output_root=args.output_root,
+                episodes=args.episodes,
+                latest=args.latest or args.repo_id is None,
+                dry_run=args.dry_run,
+            )
         case "data-push":
             dataset_push(args.repo_id, args.root, push_to_hub=args.push_to_hub)
         case "lelab":

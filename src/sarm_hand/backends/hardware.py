@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..config import ProjectConfig
@@ -15,7 +16,8 @@ class HardwareRobot(RobotBackend):
     def __init__(self, port: str, cfg: ProjectConfig, *, use_cameras: bool = True):
         from ..cameras import install_all_camera_patches
 
-        install_all_camera_patches()
+        self._cfg = cfg
+        install_all_camera_patches(cfg=cfg)
         from lerobot.robots.so_follower import SO101Follower
         from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
 
@@ -58,10 +60,27 @@ class HardwareRobot(RobotBackend):
         return self._robot.is_connected
 
     def connect(self) -> None:
-        if self._robot.cameras:
-            connect_follower_robot(self._robot, calibrate=False)
-        else:
-            self._robot.connect(calibrate=False)
+        from ..robot import _motor_write_retries
+
+        last_exc: ConnectionError | None = None
+        for attempt in range(2):
+            try:
+                with _motor_write_retries():
+                    if self._robot.cameras:
+                        connect_follower_robot(
+                            self._robot, calibrate=False, cfg=self._cfg
+                        )
+                    else:
+                        self._robot.connect(calibrate=False)
+                return
+            except ConnectionError as exc:
+                last_exc = exc
+                if self._robot.is_connected:
+                    self._robot.disconnect()
+                if attempt == 0:
+                    time.sleep(0.5)
+        assert last_exc is not None
+        raise last_exc
 
     def disconnect(self) -> None:
         self._robot.disconnect()

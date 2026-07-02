@@ -9,6 +9,7 @@ authors = [{ name = "S-ARM101 Team" }]
 keywords = ["robotics", "lerobot", "so-arm101", "teleoperation", "phospho"]
 dependencies = [
     "lerobot[core_scripts,feetech]>=0.5.0",
+    "opencv-python-headless>=4.8",
     "pyyaml>=6.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",

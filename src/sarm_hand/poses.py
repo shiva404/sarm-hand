@@ -2,12 +2,201 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
-from .config import JOINT_NAMES, ProjectConfig
-from .robot import build_robot, ensure_port
+from .calibration_bridge import leader_pose_to_follower_action, require_teleop_calibrations
+from .config import JOINT_NAMES, PROJECT_ROOT, ProjectConfig
+from .genesis.calibration import raw_to_norm
+from .robot import build_robot, disable_arm_torque, ensure_port, resolve_role_port
+
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "default.yaml"
+
+
+def compute_rest_pose_from_genesis(
+    cfg: ProjectConfig,
+    *,
+    role: str = "follower",
+) -> dict[str, float] | None:
+    """Map ``genesis.home_raw`` (leader at folded rest) to LeRobot norm for leader or follower."""
+    home_raw = cfg.genesis.home_raw
+    if not home_raw or not all(j in home_raw for j in JOINT_NAMES):
+        return None
+    try:
+        leader_cal, follower_cal = require_teleop_calibrations(cfg)
+    except SystemExit:
+        return None
+
+    leader_joints = {
+        joint: raw_to_norm(int(home_raw[joint]), joint, leader_cal) for joint in JOINT_NAMES
+    }
+    if role == "leader":
+        return leader_joints
+
+    follower_action = leader_pose_to_follower_action(
+        joints=leader_joints,
+        raw={joint: int(home_raw[joint]) for joint in JOINT_NAMES},
+        leader_cal=leader_cal,
+        follower_cal=follower_cal,
+    )
+    return {joint: float(follower_action[f"{joint}.pos"]) for joint in JOINT_NAMES}
+
+
+def format_pose_yaml(name: str, pose: dict[str, float]) -> str:
+    lines = [f"  {name}:"]
+    for joint in JOINT_NAMES:
+        lines.append(f"    {joint}: {pose[joint]:.1f}")
+    return "\n".join(lines)
+
+
+def _pose_block_pattern(name: str) -> re.Pattern[str]:
+    """Match a poses.<name> block (allows comment lines between joints)."""
+    return re.compile(
+        rf"^  {re.escape(name)}:\n"
+        rf"(?:    (?:#.*|\w+: [-0-9.]+)\n)+",
+        re.MULTILINE,
+    )
+
+
+def patch_pose_in_yaml(
+    path: Path,
+    name: str,
+    pose: dict[str, float],
+    *,
+    rest_from_genesis: bool | None = None,
+) -> None:
+    """Replace a pose block under ``poses:`` in config/default.yaml."""
+    text = path.read_text()
+    block = format_pose_yaml(name, pose)
+    pattern = _pose_block_pattern(name)
+    if not pattern.search(text):
+        raise ValueError(f"No poses.{name} block found in {path}")
+    updated = pattern.sub(block + "\n", text, count=1)
+    if rest_from_genesis is not None:
+        flag = "true" if rest_from_genesis else "false"
+        if "rest_from_genesis:" in updated:
+            updated = re.sub(
+                r"^  rest_from_genesis: .*$",
+                f"  rest_from_genesis: {flag}",
+                updated,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        else:
+            updated = updated.replace(
+                "poses:\n",
+                f"poses:\n  rest_from_genesis: {flag}\n",
+                1,
+            )
+    path.write_text(updated)
+
+
+def read_role_pose_norm(
+    role: str,
+    port: str,
+    cfg: ProjectConfig,
+) -> dict[str, float]:
+    """Read current joint norms with torque off (physical rest pose)."""
+    if role == "follower":
+        robot = build_robot(port, cfg, use_cameras=False)
+        try:
+            robot.bus.disable_torque(num_retry=5)
+            time.sleep(0.3)
+            obs = robot.get_observation()
+        finally:
+            robot.disconnect()
+        return {joint: float(obs[f"{joint}.pos"]) for joint in JOINT_NAMES}
+
+    from lerobot.teleoperators.so_leader import SO101Leader
+    from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
+
+    disable_arm_torque(role, port)
+    leader_cfg = SO101LeaderConfig(
+        id=cfg.teleop.leader.id,
+        port=port,
+        use_degrees=cfg.robot.use_degrees,
+    )
+    leader = SO101Leader(leader_cfg)
+    try:
+        leader.connect()
+        leader.bus.disable_torque(num_retry=5)
+        time.sleep(0.3)
+        action = leader.get_action()
+    finally:
+        leader.disconnect()
+    return {joint: float(action[f"{joint}.pos"]) for joint in JOINT_NAMES}
+
+
+def capture_pose(
+    *,
+    role: str,
+    name: str,
+    port: str | None = None,
+    save: bool = False,
+    config_path: Path | None = None,
+) -> dict[str, float]:
+    """Read the arm's current pose and optionally save it under poses.<name> in config."""
+    if name not in ("home", "ready", "park"):
+        print(f"Unknown pose name {name!r}. Use: home, ready, park", file=sys.stderr)
+        raise SystemExit(1)
+
+    cfg = ProjectConfig.load()
+    resolved_port = resolve_role_port(role, port)
+    print(f"Place the {role} arm in its physical rest pose (torque will be disabled to read).")
+    pose = read_role_pose_norm(role, resolved_port, cfg)
+
+    print(f"Captured {role} pose for poses.{name} (torque off, normalized units):\n")
+    print(format_pose_yaml(name, pose))
+    if role == "follower" and name == "ready":
+        genesis = compute_rest_pose_from_genesis(cfg, role="follower")
+        if genesis:
+            print("\nFor comparison, genesis.home_raw → follower rest:")
+            print(format_pose_yaml("ready (genesis)", genesis))
+
+    if save:
+        path = config_path or DEFAULT_CONFIG_PATH
+        rest_flag = False if name == "ready" else None
+        patch_pose_in_yaml(path, name, pose, rest_from_genesis=rest_flag)
+        print(f"\nUpdated {path}")
+        if name == "ready":
+            print("  Set poses.rest_from_genesis: false (using captured values)")
+    else:
+        print("\nAdd to config with:  --save")
+
+    return pose
+
+
+def move_connected_follower_to_pose(
+    robot,
+    cfg: ProjectConfig,
+    pose_name: str,
+    *,
+    duration_s: float = 3.0,
+) -> None:
+    """Move an already-connected follower to a named pose."""
+    target = cfg.resolve_pose(pose_name, role="follower")
+    print(f"Moving to '{pose_name}' ({duration_s:.1f}s)...")
+    _move_to_pose(robot, target, duration_s=duration_s, fps=cfg.dataset.fps)
+
+
+def move_follower_to_pose(
+    cfg: ProjectConfig,
+    pose_name: str,
+    *,
+    port: str | None = None,
+    duration_s: float = 3.0,
+) -> None:
+    """Smoothly move follower to a named pose (uses resolve_pose for ``ready``)."""
+    resolved_port = ensure_port(port or cfg.robot.port, "Follower")
+    target = cfg.resolve_pose(pose_name, role="follower")
+    robot = build_robot(resolved_port, cfg, use_cameras=False)
+    try:
+        move_connected_follower_to_pose(robot, cfg, pose_name, duration_s=duration_s)
+    finally:
+        robot.disconnect()
 
 
 def list_poses(config: ProjectConfig | None = None) -> None:
@@ -15,9 +204,12 @@ def list_poses(config: ProjectConfig | None = None) -> None:
     cfg = config or ProjectConfig.load()
     print("Available poses (normalized units, tunable in config/default.yaml):\n")
     for name in cfg.pose_names():
-        pose = cfg.poses[name]
-        joints = ", ".join(f"{j}={pose[j]:.0f}" for j in JOINT_NAMES)
-        print(f"  {name:6}  {joints}")
+        pose = cfg.resolve_pose(name, role="follower") if name == "ready" else cfg.poses[name]
+        joints = ", ".join(f"{j}={pose[j]:.1f}" for j in JOINT_NAMES)
+        suffix = ""
+        if name == "ready" and cfg.rest_from_genesis:
+            suffix = "  (from genesis.home_raw rest)"
+        print(f"  {name:6}  {joints}{suffix}")
     print(f"\nDefault test sequence: {' → '.join(cfg.pose_sequence)}")
 
 
@@ -105,6 +297,8 @@ def test_poses(
     print("Pose validation test (follower arm)")
     print(f"  Port:      {resolved_port}")
     print(f"  Sequence:  {' → '.join(run_sequence)}")
+    if "ready" in run_sequence and cfg.rest_from_genesis:
+        print("  ready:     physical rest from genesis.home_raw")
     print(f"  Tolerance: ±{tolerance} (gripper ±{tolerance * 1.5:.0f})")
     print("\nKeep clear of the arm. Ctrl+C to abort.\n")
 
@@ -122,7 +316,7 @@ def test_poses(
     all_passed = True
     try:
         for name in run_sequence:
-            target = cfg.poses[name]
+            target = cfg.resolve_pose(name, role="follower")
             print(f"Moving to '{name}' ({duration_s:.1f}s)...")
             _move_to_pose(robot, target, duration_s=duration_s, fps=cfg.dataset.fps)
             time.sleep(settle_s)
@@ -143,7 +337,7 @@ def test_poses(
         print(
             "\nSome poses missed their targets."
             "\n  - Re-run calibrate if joints drift from center at home"
-            "\n  - Tune poses in config/default.yaml for your arm geometry"
+            "\n  - Capture rest: sarm-hand capture-pose --role follower --name ready --save"
             "\n  - Increase --tolerance slightly if motion is close but not exact"
         )
         sys.exit(1)

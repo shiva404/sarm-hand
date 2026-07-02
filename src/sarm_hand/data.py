@@ -77,6 +77,51 @@ def _newest_session_with_frames(
     return None
 
 
+def _is_test_subsample_dataset(repo_id: str) -> bool:
+    return "test-subsample" in repo_id
+
+
+def _dataset_summary(repo_id: str, info: dict[str, Any]) -> str:
+    episodes = int(info.get("total_episodes", 0))
+    frames = int(info.get("total_frames", 0))
+    fps = int(info.get("fps", 0))
+    return f"{repo_id} ({episodes} episodes, {frames} frames{f' @ {fps} fps' if fps else ''})"
+
+
+def _best_training_dataset(
+    cfg: ProjectConfig,
+) -> tuple[str, Path, dict[str, Any]] | None:
+    """Largest non-test-subsample local dataset with saved frames."""
+    best: tuple[str, Path, dict[str, Any]] | None = None
+    for repo_id, path, info in list_local_datasets(cfg):
+        if _is_test_subsample_dataset(repo_id):
+            continue
+        if int(info.get("total_frames", 0)) <= 0:
+            continue
+        if best is None or int(info.get("total_frames", 0)) > int(best[2].get("total_frames", 0)):
+            best = (repo_id, path, info)
+    return best
+
+
+def _should_prefer_alternate_training_dataset(repo_id: str, info: dict[str, Any]) -> bool:
+    episodes = int(info.get("total_episodes", 0))
+    return _is_test_subsample_dataset(repo_id) or episodes < 5
+
+
+def configure_ssl_certificates() -> None:
+    """Use certifi CA bundle (fixes macOS Python.org SSL verify failures)."""
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
+
+def training_subprocess_env() -> dict[str, str]:
+    """Environment for lerobot-train subprocesses (SSL + offline HF)."""
+    configure_ssl_certificates()
+    return os.environ.copy()
+
+
 def configure_local_lerobot_env(cfg: ProjectConfig) -> Path:
     """Force LeRobot to read/write datasets under the project tree (never Hub by default)."""
     dataset_home = cfg.resolve_dataset_root()
@@ -120,6 +165,35 @@ def _count_dataset_artifacts(dataset_dir: Path) -> tuple[int, int]:
     return parquet, mp4
 
 
+def dataset_demo_start_action_mean(dataset_dir: Path) -> dict[str, float] | None:
+    """Mean first-frame action across episodes — typical pose at the start of demos."""
+    data_dir = dataset_dir / "data"
+    info_path = dataset_dir / "meta" / "info.json"
+    if not data_dir.is_dir() or not info_path.is_file():
+        return None
+
+    import numpy as np
+    import pandas as pd
+
+    info = json.loads(info_path.read_text())
+    names = info["features"]["action"]["names"]
+    parquets = sorted(data_dir.rglob("*.parquet"))
+    if not parquets:
+        return None
+
+    frames: list[np.ndarray] = []
+    for path in parquets:
+        df = pd.read_parquet(path, columns=["action", "episode_index"])
+        for ep in df["episode_index"].unique():
+            frames.append(np.asarray(df.loc[df["episode_index"] == ep].iloc[0]["action"], dtype=float))
+
+    if not frames:
+        return None
+
+    mean = np.mean(frames, axis=0)
+    return {name: float(val) for name, val in zip(names, mean)}
+
+
 def resolve_training_dataset(
     cfg: ProjectConfig,
     repo_id: str | None = None,
@@ -128,6 +202,7 @@ def resolve_training_dataset(
 ) -> tuple[str, Path]:
     """Resolve dataset for training — defaults to latest record-leader session with data."""
     if repo_id:
+        repo_id = repo_id.strip("/")
         path = cfg.resolve_dataset_path(repo_id)
         if not (path / "meta" / "info.json").is_file():
             _require_local_dataset(cfg, repo_id)
@@ -136,6 +211,29 @@ def resolve_training_dataset(
     resolved_repo_id, path = resolve_dataset_lookup(cfg, latest=True)
     if not (path / "meta" / "info.json").is_file():
         _require_local_dataset(cfg, resolved_repo_id, latest=True)
+
+    info = _read_dataset_info(path) or {}
+    if _should_prefer_alternate_training_dataset(resolved_repo_id, info):
+        if alt := _best_training_dataset(cfg):
+            alt_id, alt_path, alt_info = alt
+            if alt_path != path and int(alt_info.get("total_frames", 0)) > int(
+                info.get("total_frames", 0)
+            ):
+                print(
+                    "Training dataset: skipping "
+                    f"{_dataset_summary(resolved_repo_id, info)}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"  Using instead: {_dataset_summary(alt_id, alt_info)}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  (.latest_session pointed at a test subsample or tiny run; "
+                    "pass --dataset-repo-id to override.)\n",
+                    file=sys.stderr,
+                )
+                return alt_id, alt_path
 
     if require_frames:
         info = _read_dataset_info(path) or {}
@@ -477,6 +575,247 @@ def dataset_export_episode(
         writer.writerows(rows)
 
     print(f"Exported episode {episode} ({len(rows)} frames) → {csv_path}")
+
+
+def subsample_stride(source_fps: int, target_fps: int) -> int:
+    """Return keep-every-N stride to downsample ``source_fps`` → ``target_fps``."""
+    if source_fps <= 0 or target_fps <= 0:
+        raise ValueError(f"fps must be positive (got {source_fps} → {target_fps})")
+    if target_fps > source_fps:
+        raise ValueError(
+            f"target_fps ({target_fps}) must be <= source_fps ({source_fps}); "
+            "use record-leader at a higher rate instead"
+        )
+    if source_fps % target_fps != 0:
+        raise ValueError(
+            f"source_fps ({source_fps}) must be evenly divisible by target_fps ({target_fps}); "
+            f"e.g. 30→10 (stride 3) or 30→15 (stride 2)"
+        )
+    return source_fps // target_fps
+
+
+def frame_image_to_hwc_uint8(img: Any) -> Any:
+    """Convert a dataset image (CHW float tensor) to HWC uint8 for LeRobot ``add_frame``."""
+    import numpy as np
+    import torch
+
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    arr = np.asarray(img)
+    if arr.ndim == 3 and arr.shape[0] == 3:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+    return arr
+
+
+def _episode_frame_indices(dataset_path: Path) -> dict[int, list[tuple[int, int]]]:
+    """Map episode_index → [(global_index, frame_index_within_episode), ...]."""
+    import pandas as pd
+
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    data_dir = dataset_path / "data"
+    if not data_dir.is_dir():
+        return grouped
+
+    for path in sorted(data_dir.rglob("*.parquet")):
+        df = pd.read_parquet(path, columns=["episode_index", "index", "frame_index"])
+        for row in df.itertuples(index=False):
+            ep = int(row.episode_index)
+            grouped.setdefault(ep, []).append((int(row.index), int(row.frame_index)))
+
+    for ep in grouped:
+        grouped[ep].sort(key=lambda pair: pair[1])
+    return grouped
+
+
+def _default_subsample_repo_id(source_repo_id: str, target_fps: int) -> str:
+    if source_repo_id.endswith(f"-fps{target_fps}"):
+        return source_repo_id
+    return f"{source_repo_id}-fps{target_fps}"
+
+
+def _subsample_output_features(features: dict[str, Any], target_fps: int) -> dict[str, Any]:
+    import copy
+
+    out = copy.deepcopy(features)
+    for spec in out.values():
+        if spec.get("dtype") != "video":
+            continue
+        info = spec.setdefault("info", {})
+        info["video.fps"] = target_fps
+    return out
+
+
+def _frame_for_writer(item: dict[str, Any], feature_keys: set[str]) -> dict[str, Any]:
+    import numpy as np
+    import torch
+
+    frame: dict[str, Any] = {"task": item["task"]}
+    for key in feature_keys:
+        if key not in item:
+            continue
+        value = item[key]
+        if key.startswith("observation.images."):
+            frame[key] = frame_image_to_hwc_uint8(value)
+        elif isinstance(value, torch.Tensor):
+            frame[key] = value.detach().cpu().numpy()
+        elif isinstance(value, np.ndarray):
+            frame[key] = value
+        else:
+            frame[key] = np.asarray(value)
+    return frame
+
+
+def dataset_subsample(
+    repo_id: str | None = None,
+    root: str | None = None,
+    *,
+    target_fps: int = 10,
+    output_repo_id: str | None = None,
+    output_root: str | None = None,
+    episodes: list[int] | None = None,
+    latest: bool = False,
+    dry_run: bool = False,
+) -> Path | None:
+    """Downsample a LeRobot dataset by keeping every Nth frame (e.g. 30 fps → 10 fps).
+
+  Works on local recordings and external datasets copied under ``--root``.
+  Re-encodes videos at the new fps and recomputes dataset stats.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    cfg = ProjectConfig.load()
+    configure_local_lerobot_env(cfg)
+
+    if root:
+        resolved_repo_id = repo_id or cfg.dataset.repo_id
+        source_path = _require_local_dataset(cfg, resolved_repo_id, root)
+    else:
+        resolved_repo_id, source_path = resolve_dataset_lookup(cfg, repo_id, latest=latest)
+        if not (source_path / "meta" / "info.json").is_file():
+            source_path = _require_local_dataset(cfg, resolved_repo_id, latest=latest)
+
+    info = _read_dataset_info(source_path)
+    if info is None:
+        print(f"Could not read {source_path / 'meta' / 'info.json'}", file=sys.stderr)
+        sys.exit(1)
+
+    source_fps = int(info.get("fps", 0))
+    stride = subsample_stride(source_fps, target_fps)
+    episode_map = _episode_frame_indices(source_path)
+    if not episode_map:
+        print(f"No parquet frames found under {source_path / 'data'}", file=sys.stderr)
+        sys.exit(1)
+
+    selected_eps = sorted(episode_map) if episodes is None else sorted(episodes)
+    missing = [ep for ep in selected_eps if ep not in episode_map]
+    if missing:
+        print(f"Episode(s) not in dataset: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    kept_per_ep = {
+        ep: [(gi, fi) for gi, fi in episode_map[ep] if fi % stride == 0] for ep in selected_eps
+    }
+    total_in = sum(len(episode_map[ep]) for ep in selected_eps)
+    total_out = sum(len(rows) for rows in kept_per_ep.values())
+    out_repo_id = output_repo_id or _default_subsample_repo_id(resolved_repo_id, target_fps)
+
+    if output_root:
+        out_path = Path(output_root)
+        if not out_path.is_absolute():
+            out_path = cfg.resolve_dataset_root().parent / out_path
+    else:
+        out_path = cfg.resolve_dataset_path(out_repo_id)
+
+    print(f"Subsample {resolved_repo_id}")
+    print(f"  Source:      {source_path}")
+    print(f"  Source fps:  {source_fps}")
+    print(f"  Target fps:  {target_fps}  (keep every {stride} frame(s))")
+    print(f"  Episodes:    {len(selected_eps)}")
+    print(f"  Frames:      {total_in} → {total_out}")
+    print(f"  Output:      {out_repo_id}")
+    print(f"  Path:        {out_path}")
+
+    if dry_run:
+        return out_path
+
+    if out_path.exists() and any(out_path.iterdir()):
+        print(f"Output path already exists: {out_path}", file=sys.stderr)
+        print("  Pass --output-repo-id or remove the directory first.", file=sys.stderr)
+        sys.exit(1)
+
+    src = LeRobotDataset(
+        resolved_repo_id,
+        root=source_path,
+        episodes=selected_eps,
+        download_videos=True,
+        force_cache_sync=False,
+        video_backend="pyav",
+    )
+
+    vcodec = "h264"
+    for spec in src.meta.features.values():
+        if spec.get("dtype") == "video":
+            vcodec = spec.get("info", {}).get("video.codec", vcodec)
+            break
+
+    write_keys = {
+        key
+        for key in src.meta.features
+        if key == "action" or key.startswith("observation.")
+    }
+
+    dst = LeRobotDataset.create(
+        repo_id=out_repo_id,
+        fps=target_fps,
+        features=_subsample_output_features(src.meta.features, target_fps),
+        root=out_path,
+        robot_type=src.meta.robot_type,
+        use_videos=True,
+        vcodec=vcodec,
+        image_writer_processes=0,
+        image_writer_threads=4,
+        video_backend="pyav",
+    )
+
+    for ep_i, ep in enumerate(selected_eps, start=1):
+        kept = kept_per_ep[ep]
+        if not kept:
+            print(f"  Episode {ep}: no frames after subsample — skipped", file=sys.stderr)
+            continue
+        print(f"  Episode {ep_i}/{len(selected_eps)}: {len(kept)} frames", flush=True)
+        for global_idx, _frame_idx in kept:
+            item = src[global_idx]
+            dst.add_frame(_frame_for_writer(item, write_keys))
+        dst.save_episode(parallel_encoding=False)
+
+    dst.finalize()
+    write_session_manifest(out_path, out_repo_id, fps=target_fps, task=_read_source_task(source_path))
+    write_latest_session_pointer(cfg, out_repo_id, out_path)
+
+    out_info = _read_dataset_info(out_path) or {}
+    print(
+        f"\nDone: {out_repo_id} — {out_info.get('total_episodes', '?')} episodes,"
+        f" {out_info.get('total_frames', '?')} frames @ {out_info.get('fps', target_fps)} fps"
+    )
+    print(f"  Train with: uv run sarm-hand train-act --dataset-repo-id {out_repo_id}")
+    return out_path
+
+
+def _read_source_task(dataset_path: Path) -> str:
+    tasks_path = dataset_path / "meta" / "tasks.parquet"
+    if not tasks_path.is_file():
+        return "task"
+    try:
+        import pandas as pd
+
+        tasks = pd.read_parquet(tasks_path)
+        if len(tasks):
+            return str(tasks.index[0])
+    except Exception:
+        pass
+    return "task"
 
 
 def dataset_push(

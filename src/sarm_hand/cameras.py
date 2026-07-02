@@ -54,6 +54,368 @@ def _quiet_opencv():
             cv2.setLogLevel(saved_level)
 
 
+# Common USB resolutions to try (width, height). Order: high → low for display.
+COMMON_PROBE_RESOLUTIONS: tuple[tuple[int, int], ...] = (
+    (3840, 2160),
+    (2560, 1440),
+    (1920, 1080),
+    (1600, 900),
+    (1280, 720),
+    (1024, 576),
+    (960, 540),
+    (800, 600),
+    (640, 480),
+    (640, 360),
+    (480, 270),
+    (320, 240),
+)
+
+
+def _opencv_usb_backend() -> int | None:
+    import cv2
+
+    if platform.system() == "Darwin":
+        return cv2.CAP_AVFOUNDATION
+    return None
+
+
+def _probe_usb_resolution(
+    cv2,
+    target: int | str,
+    width: int,
+    height: int,
+    *,
+    backend: int | None = None,
+    fps: float | None = None,
+) -> dict[str, Any] | None:
+    """Try one capture size; return actual dims + frame size when a frame is read."""
+    api = backend if backend is not None else _opencv_usb_backend()
+    if api is None:
+        api = cv2.CAP_ANY
+    camera = cv2.VideoCapture(target, api)
+    try:
+        if not camera.isOpened():
+            return None
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        if fps is not None and fps > 0:
+            camera.set(cv2.CAP_PROP_FPS, float(fps))
+        actual_w = int(round(camera.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        actual_h = int(round(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        actual_fps = float(camera.get(cv2.CAP_PROP_FPS))
+        frame_w = frame_h = None
+        for _ in range(25):
+            ok, frame = camera.read()
+            if ok and frame is not None:
+                frame_h, frame_w = frame.shape[:2]
+                break
+            time.sleep(0.04)
+        if frame_w is None:
+            return None
+        return {
+            "requested": (width, height),
+            "actual": (actual_w, actual_h),
+            "frame": (frame_w, frame_h),
+            "fps": actual_fps if actual_fps > 0 else None,
+        }
+    finally:
+        camera.release()
+
+
+def probe_usb_camera_resolutions(
+    target: int | str,
+    *,
+    fps: float | None = None,
+    resolutions: tuple[tuple[int, int], ...] | None = None,
+) -> dict[str, Any]:
+    """Probe default profile and common resolutions for one USB camera."""
+    import cv2
+
+    prepare_opencv_platform()
+    backend = _opencv_usb_backend()
+    result: dict[str, Any] = {"id": target, "default": None, "modes": [], "working": []}
+
+    with _quiet_opencv():
+        default = _probe_usb_camera(cv2, target, backend=backend)
+        if default:
+            profile = default.get("default_stream_profile", {})
+            result["default"] = profile
+            default_probe = _probe_usb_resolution(
+                cv2,
+                target,
+                int(profile.get("width") or 0),
+                int(profile.get("height") or 0),
+                backend=backend,
+                fps=fps,
+            )
+            if default_probe:
+                default_probe["label"] = "default"
+                result["working"].append(default_probe)
+
+        seen: set[tuple[int, int]] = set()
+        for width, height in resolutions or COMMON_PROBE_RESOLUTIONS:
+            if (width, height) in seen:
+                continue
+            seen.add((width, height))
+            mode = _probe_usb_resolution(
+                cv2, target, width, height, backend=backend, fps=fps
+            )
+            if mode is None:
+                result["modes"].append(
+                    {
+                        "requested": (width, height),
+                        "works": False,
+                    }
+                )
+                continue
+            mode["works"] = True
+            result["modes"].append(mode)
+            frame_key = mode["frame"]
+            if frame_key not in {m["frame"] for m in result["working"]}:
+                result["working"].append(mode)
+
+    result["working"].sort(key=lambda m: m["frame"][0] * m["frame"][1], reverse=True)
+    return result
+
+
+def probe_usb_cameras_together(
+    targets: list[int | str],
+    width: int,
+    height: int,
+    *,
+    fps: float | None = None,
+) -> dict[str, Any]:
+    """Open all USB cameras at once and verify each delivers a frame."""
+    import cv2
+
+    prepare_opencv_platform()
+    backend = _opencv_usb_backend()
+    api = backend if backend is not None else cv2.CAP_ANY
+    cameras: list[tuple[int | str, Any]] = []
+    per_camera: list[dict[str, Any]] = []
+
+    with _quiet_opencv():
+        try:
+            for target in targets:
+                camera = cv2.VideoCapture(target, api)
+                if not camera.isOpened():
+                    per_camera.append({"id": target, "opened": False})
+                    raise RuntimeError(f"index {target!r} failed to open")
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+                if fps is not None and fps > 0:
+                    camera.set(cv2.CAP_PROP_FPS, float(fps))
+                actual_w = int(round(camera.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                actual_h = int(round(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                cameras.append((target, camera))
+                per_camera.append(
+                    {
+                        "id": target,
+                        "opened": True,
+                        "actual": (actual_w, actual_h),
+                        "frame": None,
+                    }
+                )
+                if len(cameras) > 1:
+                    time.sleep(0.5 if platform.system() == "Darwin" else 0.1)
+
+            ok_all = True
+            for i, (target, camera) in enumerate(cameras):
+                frame_ok = False
+                for _ in range(25):
+                    ok, frame = camera.read()
+                    if ok and frame is not None:
+                        fh, fw = frame.shape[:2]
+                        per_camera[i]["frame"] = (fw, fh)
+                        frame_ok = True
+                        break
+                    time.sleep(0.04)
+                if not frame_ok:
+                    ok_all = False
+                    per_camera[i]["frame"] = None
+        finally:
+            for _, camera in cameras:
+                camera.release()
+
+    return {
+        "requested": (width, height),
+        "fps": fps,
+        "targets": targets,
+        "ok": ok_all and all(row.get("frame") for row in per_camera),
+        "cameras": per_camera,
+    }
+
+
+def _recommend_capture_mode(
+    probe: dict[str, Any],
+    *,
+    output_width: int = 640,
+    output_height: int = 480,
+    prefer_below: tuple[int, int] | None = (1280, 720),
+) -> dict[str, Any] | None:
+    """Pick a working capture mode — prefer <= prefer_below pixels, else smallest working."""
+    working = probe.get("working") or []
+    if not working:
+        return None
+
+    def pixels(mode: dict[str, Any]) -> int:
+        fw, fh = mode["frame"]
+        return fw * fh
+
+    if prefer_below:
+        pw, ph = prefer_below
+        cap = pw * ph
+        candidates = [m for m in working if pixels(m) <= cap]
+        if candidates:
+            return max(candidates, key=pixels)
+
+    return min(working, key=pixels)
+
+
+def _format_probe_yaml_snippet(
+    name: str,
+    cam: CameraSettings,
+    mode: dict[str, Any],
+    *,
+    output_width: int,
+    output_height: int,
+) -> str:
+    fw, fh = mode["frame"]
+    lines = [
+        f"  {name}:",
+        f"    type: {cam.type}",
+    ]
+    if cam.url:
+        lines.append(f"    url: {cam.url}")
+    elif cam.host:
+        lines.append(f"    host: {cam.host}")
+        lines.append(f"    port: {cam.port or 82}")
+    else:
+        lines.append(f"    index_or_path: {cam.index_or_path}")
+    if fw == output_width and fh == output_height:
+        lines.extend([
+            f"    width: {output_width}",
+            f"    height: {output_height}",
+            "    auto_resolution: false",
+        ])
+    else:
+        lines.extend([
+            f"    capture_width: {fw}",
+            f"    capture_height: {fh}",
+            f"    width: {output_width}          # dataset output (downscaled)",
+            f"    height: {output_height}",
+            "    auto_resolution: false",
+        ])
+    if cam.fps is not None:
+        lines.append(f"    fps: {cam.fps}")
+    return "\n".join(lines)
+
+
+def probe_camera_resolutions(
+    *,
+    index: int | None = None,
+    name: str | None = None,
+    all_usb: bool = False,
+    together: bool = False,
+    output_width: int = 640,
+    output_height: int = 480,
+    fps: float | None = None,
+) -> None:
+    """Print supported USB capture resolutions and optional multi-cam check."""
+    cfg = ProjectConfig.load()
+    prepare_opencv_platform()
+
+    usb_targets: list[tuple[str, int | str, CameraSettings | None]] = []
+    if index is not None:
+        usb_targets.append((f"index-{index}", index, None))
+    elif name:
+        if name not in cfg.cameras:
+            raise SystemExit(f"Unknown camera {name!r}. Configured: {', '.join(cfg.cameras)}")
+        cam = cfg.cameras[name]
+        if is_stream_camera(cam) or is_udp_camera(cam):
+            raise SystemExit(f"Camera {name!r} is a network stream — resolution probe is USB-only.")
+        usb_targets.append((name, resolve_camera_source(cam), cam))
+    elif all_usb or not cfg.cameras:
+        for info in find_usb_cameras(verify_capture=False):
+            usb_targets.append((str(info["id"]), info["id"], None))
+    else:
+        for cam_name, cam in cfg.cameras.items():
+            if is_stream_camera(cam) or is_udp_camera(cam):
+                print(f"Skipping {cam_name} ({cam.type}) — network camera\n")
+                continue
+            usb_targets.append((cam_name, resolve_camera_source(cam), cam))
+
+    if not usb_targets:
+        print("No USB cameras to probe.")
+        sys.exit(1)
+
+    probes: list[tuple[str, dict[str, Any], CameraSettings | None]] = []
+    for label, target, cam in usb_targets:
+        print(f"=== {label} (source={target!r}) ===")
+        probe = probe_usb_camera_resolutions(target, fps=fps)
+        probes.append((label, probe, cam))
+        default = probe.get("default") or {}
+        if default:
+            print(
+                f"Driver default: {default.get('width')}x{default.get('height')} "
+                f"@ {default.get('fps')} fps ({default.get('fourcc', '?')})"
+            )
+        print("\nResolution probe (requested → OpenCV actual → frame):")
+        for mode in probe.get("modes", []):
+            if not mode.get("works"):
+                req_w, req_h = mode["requested"]
+                print(f"  ✗ {req_w}x{req_h} — no frames")
+                continue
+            req_w, req_h = mode["requested"]
+            act_w, act_h = mode["actual"]
+            frm_w, frm_h = mode["frame"]
+            fps_note = f" @ {mode['fps']:.1f}fps" if mode.get("fps") else ""
+            match = "exact" if (req_w, req_h) == (act_w, act_h) == (frm_w, frm_h) else "approx"
+            print(
+                f"  ✓ {req_w}x{req_h} → {act_w}x{act_h} → frame {frm_w}x{frm_h}{fps_note} ({match})"
+            )
+
+        rec = _recommend_capture_mode(
+            probe, output_width=output_width, output_height=output_height
+        )
+        if rec:
+            fw, fh = rec["frame"]
+            print(f"\nSuggested capture: {fw}x{fh} → output {output_width}x{output_height}")
+            if cam is not None:
+                print("\n" + _format_probe_yaml_snippet(
+                    label, cam, rec, output_width=output_width, output_height=output_height
+                ))
+        else:
+            print("\nNo working capture modes found.")
+        print()
+
+    if together and len(usb_targets) > 1:
+        ids = [target for _, target, _ in usb_targets]
+        print(f"=== Multi-camera together ({len(ids)} USB) ===")
+        best: dict[str, Any] | None = None
+        for width, height in COMMON_PROBE_RESOLUTIONS:
+            trial = probe_usb_cameras_together(ids, width, height, fps=fps)
+            status = "OK" if trial["ok"] else "FAIL"
+            print(f"  {status}  {width}x{height}")
+            for row in trial["cameras"]:
+                frame = row.get("frame")
+                actual = row.get("actual")
+                frame_s = f"{frame[0]}x{frame[1]}" if frame else "no frame"
+                actual_s = f"{actual[0]}x{actual[1]}" if actual else "?"
+                print(f"       id {row['id']!r}: actual {actual_s}, frame {frame_s}")
+            if trial["ok"]:
+                best = trial
+        if best:
+            w, h = best["requested"]
+            print(
+                f"\nAll cameras work together at {w}x{h} "
+                f"(lowest verified common mode — use as capture_width/height)."
+            )
+        else:
+            print("\nNo common resolution worked for all cameras simultaneously.")
+            print("Try fewer cameras, different USB ports, or lower output sizes.")
+
+
 def _probe_usb_camera(cv2, target: int | str, *, backend: int | None = None) -> dict[str, Any] | None:
     api = backend if backend is not None else cv2.CAP_ANY
     camera = cv2.VideoCapture(target, api)
@@ -212,7 +574,8 @@ def list_usb_cameras() -> None:
     if len(working) < len(cameras):
         print(
             "Some indices open but never deliver frames — reseat USB, try another port,\n"
-            "or close FaceTime/Zoom. Use only indices with captures: yes in config/default.yaml."
+            "or close FaceTime/Zoom. Use only indices with captures: yes in config/default.yaml.\n"
+            "Run: uv run sarm-hand camera-probe --together"
         )
 
 
@@ -310,27 +673,46 @@ def resolve_camera_source(cam: CameraSettings) -> int | str | Path:
 
 
 _STREAM_MAX_FRAME_AGE_MS: dict[str, int] = {}
-# USB capture at native resolution, downscale to this size on read (key = str(source)).
+# USB capture at native/explicit resolution, downscale to output size on read.
 _OUTPUT_SIZE_BY_SOURCE: dict[str, tuple[int, int]] = {}
+_CAPTURE_SIZE_BY_SOURCE: dict[str, tuple[int, int]] = {}
 
 
 def _source_key(source: int | str | Path) -> str:
     return str(source)
 
 
-def _wants_downscale(cam: CameraSettings) -> bool:
-    """Capture natively (auto_resolution) but deliver width×height frames."""
-    return (
-        bool(cam.auto_resolution)
-        and not is_stream_camera(cam)
-        and not is_udp_camera(cam)
-        and cam.width is not None
-        and cam.height is not None
-    )
-
-
 def _register_output_size(source: int | str | Path, width: int, height: int) -> None:
     _OUTPUT_SIZE_BY_SOURCE[_source_key(source)] = (int(width), int(height))
+
+
+def _register_capture_size(source: int | str | Path, width: int, height: int) -> None:
+    _CAPTURE_SIZE_BY_SOURCE[_source_key(source)] = (int(width), int(height))
+
+
+def _explicit_capture_dims(cam: CameraSettings) -> tuple[int, int] | None:
+    if cam.capture_width and cam.capture_height:
+        return int(cam.capture_width), int(cam.capture_height)
+    return None
+
+
+def _output_dims(cam: CameraSettings) -> tuple[int, int]:
+    return int(cam.width or 640), int(cam.height or 480)
+
+
+def _wants_downscale(cam: CameraSettings) -> bool:
+    """Deliver width×height frames, capturing natively or at capture_width×capture_height."""
+    if is_stream_camera(cam) or is_udp_camera(cam):
+        return False
+    out_w, out_h = _output_dims(cam)
+    if cam.width is None or cam.height is None:
+        return False
+    if cam.auto_resolution:
+        return True
+    cap = _explicit_capture_dims(cam)
+    if cap and cap != (out_w, out_h):
+        return True
+    return False
 
 
 def _declared_camera_dims(cam: CameraSettings) -> tuple[int, int, int]:
@@ -350,7 +732,7 @@ def _default_stream_max_frame_age(fps: float | int | None) -> int:
 def effective_camera_settings(cam: CameraSettings) -> CameraSettings:
     """Apply auto_resolution and platform defaults before opening a camera."""
     updates: dict[str, Any] = {}
-    if cam.auto_resolution:
+    if cam.auto_resolution and not (cam.capture_width and cam.capture_height):
         updates.update(width=None, height=None, fps=None)
     if is_stream_camera(cam):
         # Declared width/height/fps satisfy LeRobot robot config; connect uses native
@@ -461,6 +843,7 @@ def install_usb_downscale_patch() -> None:
 
     def _configure_capture_settings(self) -> None:
         out = _OUTPUT_SIZE_BY_SOURCE.get(_source_key(self.index_or_path))
+        cap = _CAPTURE_SIZE_BY_SOURCE.get(_source_key(self.index_or_path))
         if out is None:
             original_configure(self)
             return
@@ -469,6 +852,10 @@ def install_usb_downscale_patch() -> None:
             self._validate_fourcc()
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+        if cap is not None:
+            self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(cap[0]))
+            self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(cap[1]))
 
         native_w = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         native_h = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -519,6 +906,9 @@ def camera_to_lerobot_dict(cam: CameraSettings) -> dict[str, Any]:
     if _wants_downscale(cam):
         install_usb_downscale_patch()
         _register_output_size(source, out_w, out_h)
+        cap = _explicit_capture_dims(cam)
+        if cap is not None:
+            _register_capture_size(source, cap[0], cap[1])
     payload: dict[str, Any] = {
         "type": "opencv",
         "index_or_path": source,
@@ -550,6 +940,9 @@ def build_lerobot_camera_config(cam: CameraSettings):
     out_w, out_h, out_fps = _declared_camera_dims(cam)
     if _wants_downscale(cam):
         _register_output_size(source, out_w, out_h)
+        cap = _explicit_capture_dims(cam)
+        if cap is not None:
+            _register_capture_size(source, cap[0], cap[1])
     if is_stream_camera(cam) and cam.max_frame_age_ms is not None:
         _STREAM_MAX_FRAME_AGE_MS[str(source)] = cam.max_frame_age_ms
     if is_udp_camera(cam) and cam.max_frame_age_ms is not None:
@@ -798,13 +1191,27 @@ def build_camera_from_config(cam: CameraSettings):
     return make_cameras_from_configs({"_preview": config})["_preview"]
 
 
-def install_all_camera_patches() -> None:
-    """Install stream, UDP, downscale, resilient, and follower-connect camera patches."""
+def install_all_camera_patches(
+    *,
+    cfg: ProjectConfig | None = None,
+    resilient: bool | None = None,
+) -> None:
+    """Install stream, UDP, downscale, optional resilient, and follower-connect camera patches."""
+    cfg = cfg or ProjectConfig.load()
+    if resilient is None:
+        resilient = not cfg.camera.fail_on_error
     install_udp_camera_patch()
     install_stream_camera_patch()
     install_usb_downscale_patch()
-    install_resilient_camera_patch()
+    if resilient:
+        install_resilient_camera_patch()
     install_follower_connect_patch()
+
+
+def camera_black_fallback_enabled(cfg: ProjectConfig | None = None) -> bool:
+    """True when connect/read failures should emit black frames instead of raising."""
+    cfg = cfg or ProjectConfig.load()
+    return not cfg.camera.fail_on_error
 
 
 def install_follower_connect_patch() -> None:
@@ -824,6 +1231,9 @@ def install_follower_connect_patch() -> None:
                 connect_follower_robot(self, calibrate=calibrate)
                 return
             original_connect(self, calibrate=calibrate)
+            from .robot import sync_follower_goals_to_present
+
+            sync_follower_goals_to_present(self)
 
         return connect
 
@@ -852,18 +1262,24 @@ def require_working_cameras(cfg: ProjectConfig) -> None:
 def connect_usb_cameras(
     cameras: dict[str, Any],
     *,
+    cfg: ProjectConfig | None = None,
     stagger_s: float | None = None,
     retries: int = 2,
-    fallback_black: bool = True,
+    fallback_black: bool | None = None,
 ) -> None:
     """Open USB cameras with staggered connect (macOS multi-cam is flaky back-to-back)."""
     if not cameras:
         return
 
+    cfg = cfg or ProjectConfig.load()
+    if fallback_black is None:
+        fallback_black = camera_black_fallback_enabled(cfg)
+
     prepare_opencv_platform()
     if fallback_black:
-        install_all_camera_patches()
+        install_all_camera_patches(cfg=cfg, resilient=True)
     else:
+        install_udp_camera_patch()
         install_stream_camera_patch()
         install_usb_downscale_patch()
 
@@ -882,6 +1298,10 @@ def connect_usb_cameras(
             try:
                 cam.connect()
                 if getattr(cam, "_sarm_black_fallback", False):
+                    if not fallback_black:
+                        raise ConnectionError(
+                            f"Camera '{name}' is not capturing (black-frame fallback active)"
+                        )
                     print(f"  {name}: black frames (configured index unavailable)")
                 last_exc = None
                 break
@@ -895,7 +1315,34 @@ def connect_usb_cameras(
             if fallback_black:
                 _enable_black_fallback(cam, last_exc, label=name)
             else:
-                raise ConnectionError(f"Camera '{name}' failed to connect: {last_exc}") from last_exc
+                raise ConnectionError(
+                    f"Camera '{name}' failed to connect: {last_exc}\n"
+                    "  Run: sarm-hand list-cameras  and  sarm-hand camera-test\n"
+                    "  To allow black-frame fallback (not recommended for recording), "
+                    "set camera.fail_on_error: false in config/default.yaml"
+                ) from last_exc
+
+
+def connect_follower_robot(
+    robot: Any,
+    *,
+    calibrate: bool = False,
+    cfg: ProjectConfig | None = None,
+) -> None:
+    """Connect follower arm: cameras first, then servo bus (avoids bus timeout during cam warmup)."""
+    from .robot import ensure_bus_calibration, sync_follower_goals_to_present
+
+    cfg = cfg or ProjectConfig.load()
+    if robot.cameras:
+        print(f"Connecting {len(robot.cameras)} camera(s)...")
+        connect_usb_cameras(robot.cameras, cfg=cfg)
+    robot.bus.connect()
+    if not robot.is_calibrated and calibrate:
+        robot.calibrate()
+    elif not robot.is_calibrated:
+        ensure_bus_calibration(robot, "follower")
+    robot.configure()
+    sync_follower_goals_to_present(robot)
 
 
 def prepare_opencv_platform() -> None:
@@ -903,21 +1350,6 @@ def prepare_opencv_platform() -> None:
     if platform.system() != "Darwin":
         return
     os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_LIST", "AVFOUNDATION")
-
-
-def connect_follower_robot(robot: Any, *, calibrate: bool = False) -> None:
-    """Connect follower arm: cameras first, then servo bus (avoids bus timeout during cam warmup)."""
-    from .robot import ensure_bus_calibration
-
-    if robot.cameras:
-        print(f"Connecting {len(robot.cameras)} camera(s)...")
-        connect_usb_cameras(robot.cameras)
-    robot.bus.connect()
-    if not robot.is_calibrated and calibrate:
-        robot.calibrate()
-    elif not robot.is_calibrated:
-        ensure_bus_calibration(robot, "follower")
-    robot.configure()
 
 
 def build_robot_camera_configs(cfg: ProjectConfig) -> dict:
@@ -947,8 +1379,12 @@ def describe_camera(name: str, cam: CameraSettings) -> str:
     else:
         kind = "usb"
     parts = [f"{name}: {kind} ({cam.type})", f"source={source!r}"]
-    if _wants_downscale(cam):
-        parts.append(f"{cam.width}x{cam.height} (downscale from native)")
+    cap = _explicit_capture_dims(cam)
+    out_w, out_h = _output_dims(cam)
+    if cap and _wants_downscale(cam):
+        parts.append(f"capture {cap[0]}x{cap[1]} → output {out_w}x{out_h}")
+    elif _wants_downscale(cam):
+        parts.append(f"native → output {out_w}x{out_h} (auto_resolution)")
     elif cam.auto_resolution:
         parts.append("auto_resolution")
     elif cam.width and cam.height:
@@ -975,7 +1411,8 @@ def _camera_failure_hints(settings: CameraSettings) -> str:
         if platform.system() == "Darwin":
             hints.extend([
                 "  macOS: System Settings → Privacy & Security → Camera → allow your terminal",
-                "  macOS: set auto_resolution: true (or width/height/fps: null) in config",
+                "  macOS: run  uv run sarm-hand camera-probe --name <camera>",
+                "  macOS: set capture_width/capture_height from probe, width/height for output",
                 "  macOS: close FaceTime/Zoom if the camera is in use elsewhere",
             ])
         elif not settings.auto_resolution and (settings.width or settings.fps):
@@ -1057,7 +1494,7 @@ def preview_camera(
         print(exc, file=sys.stderr)
         sys.exit(1)
 
-    install_all_camera_patches()
+    install_all_camera_patches(cfg=ProjectConfig.load())
     camera = build_camera_from_config(settings)
 
     print(describe_camera(name or "preview", settings))
@@ -1138,23 +1575,43 @@ def _configured_index_mismatches(cfg: ProjectConfig) -> list[str]:
     return issues
 
 
-def test_configured_cameras() -> None:
-    """Connect to each camera in config/default.yaml and grab one frame."""
-    install_all_camera_patches()
+def _expected_output_size(settings: CameraSettings) -> tuple[int, int] | None:
+    if settings.width and settings.height:
+        return int(settings.width), int(settings.height)
+    return None
+
+
+def _validate_output_frame(settings: CameraSettings, frame) -> tuple[int, int]:
+    h, w = frame.shape[:2]
+    expected = _expected_output_size(settings)
+    if expected and (w, h) != expected:
+        exp_w, exp_h = expected
+        raise RuntimeError(f"expected {exp_w}x{exp_h}, got {w}x{h}")
+    return w, h
+
+
+def build_configured_camera_instances(
+    cfg: ProjectConfig,
+    *,
+    resilient: bool | None = None,
+) -> dict[str, Any]:
+    """Instantiate all configured cameras (same configs as record-leader)."""
+    from lerobot.cameras.utils import make_cameras_from_configs
+
+    if resilient is None:
+        resilient = camera_black_fallback_enabled(cfg)
+    install_udp_camera_patch()
+    install_stream_camera_patch()
+    install_usb_downscale_patch()
+    if resilient:
+        install_resilient_camera_patch()
     prepare_opencv_platform()
-    cfg = ProjectConfig.load()
-    if not cfg.cameras:
-        print("No cameras configured in config/default.yaml")
-        sys.exit(1)
+    return make_cameras_from_configs(build_robot_camera_configs(cfg))
 
-    mismatches = _configured_index_mismatches(cfg)
-    if mismatches:
-        print("Index mismatch (run list-cameras to verify):")
-        for line in mismatches:
-            print(f"  - {line}")
-        print()
 
-    print(f"Testing {len(cfg.cameras)} configured camera(s)...\n")
+def _test_configured_cameras_sequential(cfg: ProjectConfig) -> bool:
+    """Connect each camera alone and grab one frame."""
+    print(f"Testing {len(cfg.cameras)} configured camera(s) one at a time...\n")
     failed = False
 
     for name, settings in cfg.cameras.items():
@@ -1163,6 +1620,7 @@ def test_configured_cameras() -> None:
         if (
             not settings.auto_resolution
             and not is_stream_camera(settings)
+            and not is_udp_camera(settings)
             and not _wants_downscale(settings)
         ):
             auto = replace(settings, auto_resolution=True, width=None, height=None, fps=None)
@@ -1172,11 +1630,11 @@ def test_configured_cameras() -> None:
         for label, attempt_settings in attempts:
             try:
                 frame = _read_one_frame(attempt_settings)
-                h, w = frame.shape[:2]
-                expected = (settings.height, settings.width)
-                if expected[0] and expected[1] and (h, w) != expected:
-                    raise RuntimeError(f"expected {expected[1]}x{expected[0]}, got {w}x{h}")
-                print(f"  OK{f' ({label})' if label != 'configured' else ''} — frame {w}x{h}, {frame.dtype}\n")
+                w, h = _validate_output_frame(settings, frame)
+                print(
+                    f"  OK{f' ({label})' if label != 'configured' else ''} "
+                    f"— frame {w}x{h}, {frame.dtype}\n"
+                )
                 last_error = None
                 break
             except Exception as exc:
@@ -1192,5 +1650,116 @@ def test_configured_cameras() -> None:
                 print(hints, file=sys.stderr)
 
     if failed:
+        print("Sequential camera test failed.", file=sys.stderr)
+    else:
+        print("All cameras passed sequential test.")
+    return not failed
+
+
+def _test_configured_cameras_together(cfg: ProjectConfig) -> bool:
+    """Open every configured camera at once (same path as record-leader) and read one frame each."""
+    cameras = build_configured_camera_instances(cfg, resilient=False)
+    print(
+        f"Testing {len(cameras)} configured camera(s) concurrently "
+        f"(same connect path as record-leader)...\n"
+    )
+    for name, settings in cfg.cameras.items():
+        print(f"  {describe_camera(name, settings)}")
+    print()
+
+    failed = False
+    try:
+        connect_usb_cameras(
+            cameras,
+            fallback_black=False,
+        )
+    except ConnectionError as exc:
+        print(f"Concurrent connect failed: {exc}", file=sys.stderr)
+        hints = (
+            "  Lower USB capture load: set capture_width/capture_height from camera-probe --together\n"
+            "  macOS: use different USB ports/hubs; close FaceTime/Zoom\n"
+            "  Isolate: uv run sarm-hand camera-test --each"
+        )
+        print(hints, file=sys.stderr)
+        return False
+
+    try:
+        for name, camera in cameras.items():
+            settings = cfg.cameras[name]
+            try:
+                if getattr(camera, "_sarm_black_fallback", False):
+                    raise RuntimeError("camera is using black-frame fallback (not capturing)")
+                frame = camera.read()
+                if getattr(camera, "_sarm_black_fallback", False):
+                    raise RuntimeError("camera fell back to black frames during read")
+                w, h = _validate_output_frame(settings, frame)
+                print(f"  {name}: OK — frame {w}x{h}, {frame.dtype}")
+            except Exception as exc:
+                failed = True
+                print(f"  {name}: FAIL — {exc}", file=sys.stderr)
+                hints = _camera_failure_hints(settings)
+                if hints:
+                    print(hints, file=sys.stderr)
+    finally:
+        for camera in cameras.values():
+            if camera.is_connected:
+                camera.disconnect()
+
+    if failed:
+        print("\nConcurrent camera test failed.", file=sys.stderr)
+        print(
+            "  USB bandwidth/resolution may be too high for all streams at once.\n"
+            "  Run: uv run sarm-hand camera-probe --together",
+            file=sys.stderr,
+        )
+    else:
+        print("\nAll cameras passed concurrent test.")
+    return not failed
+
+
+def test_configured_cameras(*, together: bool = False, each: bool = False) -> None:
+    """Test configured cameras — concurrent by default when multiple are defined."""
+    cfg = ProjectConfig.load()
+    if not cfg.cameras:
+        print("No cameras configured in config/default.yaml")
         sys.exit(1)
-    print("All cameras passed.")
+
+    mismatches = _configured_index_mismatches(cfg)
+    if mismatches:
+        print("Index mismatch (run list-cameras to verify):")
+        for line in mismatches:
+            print(f"  - {line}")
+        print()
+
+    multi = len(cfg.cameras) > 1
+    if each and not together:
+        run_together = False
+    elif together:
+        run_together = True
+    else:
+        run_together = multi
+
+    run_each = each or (not multi and not together)
+    if together and each:
+        run_together = True
+        run_each = True
+
+    ok = True
+    if run_together and multi:
+        ok = _test_configured_cameras_together(cfg) and ok
+        if run_each:
+            print()
+    elif run_together:
+        ok = _test_configured_cameras_sequential(cfg) and ok
+
+    if run_each:
+        ok = _test_configured_cameras_sequential(cfg) and ok
+
+    if not ok:
+        sys.exit(1)
+    if run_together and run_each and multi:
+        print("\nAll sequential and concurrent camera tests passed.")
+    elif run_together and multi:
+        pass  # message already printed
+    elif not run_together or not multi:
+        pass  # sequential message already printed

@@ -291,8 +291,10 @@ class CameraSettings:
     ESP32-CAM raw UDP (chunked JPEG, decoded on host):
       type: udp, host: 192.168.0.58, port: 82
 
-    On macOS USB cameras that reject 640x480, set auto_resolution: true and keep
-    width/height as the output size — frames are captured natively then downscaled.
+    On macOS USB cameras that reject 640x480, run `sarm-hand camera-probe` to find
+    supported capture sizes. Then set capture_width/capture_height for intake and
+    width/height for dataset output (downscaled), or use auto_resolution: true to
+    capture natively and downscale (heavier when running multiple 1080p cameras).
     """
 
     type: str = "opencv"
@@ -301,6 +303,8 @@ class CameraSettings:
     host: str | None = None
     port: int | None = 82
     auto_resolution: bool = False
+    capture_width: int | None = None
+    capture_height: int | None = None
     width: int | None = 640
     height: int | None = 480
     fps: int | None = 30
@@ -312,6 +316,14 @@ class CameraSettings:
     fps_window: int = 5
     max_frame_age_ms: int | None = None
     fourcc: str | None = None
+
+
+@dataclass
+class CameraBehaviorSettings:
+    """Global camera behavior for recording, teleop, and policy inference."""
+
+    # When true (default), connect/read failures raise and stop — no black-frame placeholder.
+    fail_on_error: bool = True
 
 
 @dataclass
@@ -344,22 +356,57 @@ class TaskSettings:
 
 
 @dataclass
-class PolicySettings:
-    """SmolVLA / LeRobot policy settings."""
+class ActPolicySettings:
+    """ACT training and inference (front + wrist cameras)."""
+
+    output_dir: str = "outputs/train/sarm101_act"
+    train_epochs: int = 25  # training passes over the dataset (not demo count)
+    train_steps: int | None = None  # override total steps; null = train_epochs × steps_per_epoch
+    train_batch_size: int = 8
+    save_freq: int = 600  # checkpoint every N training steps
+    train_num_workers: int | None = None  # auto: 0 on mps/cpu, 4 on cuda
+    control_fps: int = 10
+    episode_time_s: int = 25
+    device: str | None = None
+    max_relative_target: float | None = 10.0  # per-step joint cap; null = no clamp
+    startup_ramp_steps: int = 10  # hold pose N steps before first inference (cam warmup; don't burn ACT queue)
+    # Chunk inference (null = use inference_n_action_steps). Avoid temporal ensembling on early checkpoints — it over-damps.
+    temporal_ensemble_coeff: float | None = None
+    inference_n_action_steps: int = 50  # replan interval when temporal_ensemble_coeff is null (trained chunk is 100)
+    inference_blend_steps: int = 0  # ramp policy weight 0→1 after startup hold (0 = off)
+    replan_blend_steps: int = 0  # soften first N steps of each new chunk (0 = off)
+    action_smoothing: float = 1.0  # per-tick EMA (1.0 = off); do not combine with temporal ensembling
+    learning_rate: float = 1e-4  # ACT optimizer_lr; default 1e-5, avoid >=1e-2 (NaN)
+
+
+@dataclass
+class SmolVlaPolicySettings:
+    """SmolVLA fine-tuning and inference."""
 
     path: str = "lerobot/smolvla_base"
-    device: str | None = None  # cuda, mps, cpu — auto-detect if null
-    episode_time_s: int = 60
-    control_fps: int = 10  # inference/record loop rate; 5–10 for HTTP cameras
-    # Optional rename robot camera → policy image key. Empty = use cameras: names as-is.
-    camera_map: dict[str, str] = field(default_factory=dict)
-    empty_cameras: int | None = None  # pad missing SmolVLA slots (auto when fewer than 3 cams)
-    # smolvla_base stores stats under so100.buffer.* — remap for SO-101 inference
-    stats_buffer: str = "so100.buffer"
-    train_dataset: str | None = None
-    train_steps: int = 20_000
-    train_batch_size: int = 64
     output_dir: str = "outputs/train/sarm101_smolvla"
+    train_steps: int = 20_000
+    train_batch_size: int = 8
+    train_num_workers: int | None = None
+    control_fps: int = 10
+    episode_time_s: int = 60
+    device: str | None = None
+    camera_map: dict[str, str] = field(default_factory=dict)
+    empty_cameras: int | None = None
+    stats_buffer: str = "so100.buffer"
+
+
+@dataclass
+class PoliciesSettings:
+    """Per-policy settings — act and smolvla do not share output dirs or train hyperparams."""
+
+    train_dataset: str | None = None  # shared default dataset for train-act / train-smolvla
+    act: ActPolicySettings = field(default_factory=ActPolicySettings)
+    smolvla: SmolVlaPolicySettings = field(default_factory=SmolVlaPolicySettings)
+
+
+# Back-compat alias (deprecated flat block)
+PolicySettings = SmolVlaPolicySettings
 
 
 @dataclass
@@ -405,10 +452,11 @@ class SimSettings:
 class ProjectConfig:
     robot: RobotSettings = field(default_factory=RobotSettings)
     teleop: TeleopSettings = field(default_factory=TeleopSettings)
+    camera: CameraBehaviorSettings = field(default_factory=CameraBehaviorSettings)
     cameras: dict[str, CameraSettings] = field(default_factory=dict)
     dataset: DatasetSettings = field(default_factory=DatasetSettings)
     tasks: TaskSettings = field(default_factory=TaskSettings)
-    policy: PolicySettings = field(default_factory=PolicySettings)
+    policies: PoliciesSettings = field(default_factory=PoliciesSettings)
     lelab: LeLabSettings = field(default_factory=LeLabSettings)
     sim: SimSettings = field(default_factory=SimSettings)
     genesis: GenesisSettings = field(default_factory=GenesisSettings)
@@ -426,6 +474,7 @@ class ProjectConfig:
         name: dict(joints) for name, joints in DEFAULT_POSES.items()
     })
     _pose_sequence: tuple[str, ...] = DEFAULT_POSE_SEQUENCE
+    _rest_from_genesis: bool = True
 
     def motor_map(self, role: str) -> MotorMapSettings:
         return self.motors.get(role, MotorMapSettings())
@@ -440,6 +489,22 @@ class ProjectConfig:
 
     def pose_names(self) -> list[str]:
         return list(self._poses.keys())
+
+    def resolve_pose(self, name: str, *, role: str = "follower") -> dict[str, float]:
+        """Return pose joint targets; ``ready`` uses physical rest when rest_from_genesis is set."""
+        from .poses import compute_rest_pose_from_genesis
+
+        if name == "ready" and self._rest_from_genesis:
+            computed = compute_rest_pose_from_genesis(self, role=role)
+            if computed:
+                return computed
+        if name not in self._poses:
+            raise KeyError(f"Unknown pose {name!r}")
+        return dict(self._poses[name])
+
+    @property
+    def rest_from_genesis(self) -> bool:
+        return self._rest_from_genesis
 
     def sim_geometry(self) -> dict[str, Any]:
         if not self._geometry:
@@ -489,6 +554,34 @@ class ProjectConfig:
     def sim_value_suffix(self) -> str:
         return self.sim.value_suffix
 
+    @staticmethod
+    def _load_policies(raw: dict[str, Any]) -> PoliciesSettings:
+        block = raw.get("policies")
+        legacy = raw.get("policy", {})
+        if block:
+            return PoliciesSettings(
+                train_dataset=block.get("train_dataset"),
+                act=ActPolicySettings(**(block.get("act") or {})),
+                smolvla=SmolVlaPolicySettings(**(block.get("smolvla") or {})),
+            )
+        if legacy:
+            smolvla_raw = dict(legacy)
+            train_dataset = smolvla_raw.pop("train_dataset", None)
+            act_raw: dict[str, Any] = {}
+            for old_key, new_key in (
+                ("act_output_dir", "output_dir"),
+                ("act_train_steps", "train_steps"),
+                ("act_train_batch_size", "train_batch_size"),
+            ):
+                if old_key in smolvla_raw:
+                    act_raw[new_key] = smolvla_raw.pop(old_key)
+            return PoliciesSettings(
+                train_dataset=train_dataset,
+                act=ActPolicySettings(**act_raw),
+                smolvla=SmolVlaPolicySettings(**smolvla_raw),
+            )
+        return PoliciesSettings()
+
     @classmethod
     def load(cls, path: Path | None = None) -> ProjectConfig:
         config_path = path or DEFAULT_CONFIG_PATH
@@ -506,13 +599,14 @@ class ProjectConfig:
             control_fps=int(teleop_raw.get("control_fps", 30)),
             action_smoothing=float(teleop_raw.get("action_smoothing", 1.0)),
         )
+        camera = CameraBehaviorSettings(**raw.get("camera", {}))
         cameras = {
             name: CameraSettings(**cam_cfg)
             for name, cam_cfg in raw.get("cameras", {}).items()
         }
         dataset = DatasetSettings(**raw.get("dataset", {}))
         tasks = TaskSettings(**raw.get("tasks", {}))
-        policy = PolicySettings(**raw.get("policy", {}))
+        policies = cls._load_policies(raw)
         lelab = LeLabSettings(**raw.get("lelab", {}))
         sim = SimSettings(**raw.get("sim", {}))
         genesis_raw = raw.get("genesis", {})
@@ -545,16 +639,17 @@ class ProjectConfig:
             role: MotorMapSettings.from_yaml(motors_raw.get(role))
             for role in ("follower", "leader")
         }
-        poses, pose_sequence = _load_poses(raw.get("poses", {}))
+        poses, pose_sequence, rest_from_genesis = _load_poses(raw.get("poses", {}))
         geometry = raw.get("geometry") or {}
         joints = raw.get("joints") or {}
         return cls(
             robot=robot,
             teleop=teleop,
+            camera=camera,
             cameras=cameras,
             dataset=dataset,
             tasks=tasks,
-            policy=policy,
+            policies=policies,
             lelab=lelab,
             sim=sim,
             genesis=genesis,
@@ -565,6 +660,7 @@ class ProjectConfig:
             _joints=joints,
             _poses=poses,
             _pose_sequence=pose_sequence,
+            _rest_from_genesis=rest_from_genesis,
         )
 
     def resolve_dataset_root(self) -> Path:
@@ -618,10 +714,11 @@ class ProjectConfig:
         return {name: camera_to_lerobot_dict(cam) for name, cam in self.cameras.items()}
 
 
-def _load_poses(raw: dict[str, Any]) -> tuple[dict[str, dict[str, float]], tuple[str, ...]]:
+def _load_poses(raw: dict[str, Any]) -> tuple[dict[str, dict[str, float]], tuple[str, ...], bool]:
+    rest_from_genesis = bool(raw.get("rest_from_genesis", True))
     poses = {name: dict(joints) for name, joints in DEFAULT_POSES.items()}
     for name, joints in raw.items():
-        if name == "sequence" or not isinstance(joints, dict):
+        if name in ("sequence", "rest_from_genesis") or not isinstance(joints, dict):
             continue
         merged = dict(poses.get(name, DEFAULT_POSES.get(name, {})))
         for joint, value in joints.items():
@@ -631,7 +728,7 @@ def _load_poses(raw: dict[str, Any]) -> tuple[dict[str, dict[str, float]], tuple
 
     sequence_raw = raw.get("sequence", DEFAULT_POSE_SEQUENCE)
     pose_sequence = tuple(sequence_raw) if sequence_raw else DEFAULT_POSE_SEQUENCE
-    return poses, pose_sequence
+    return poses, pose_sequence, rest_from_genesis
 
 
 def parse_initial_ids(spec: str | None) -> dict[str, int]:

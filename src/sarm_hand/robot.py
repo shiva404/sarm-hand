@@ -432,6 +432,41 @@ def _print_calibration_failure_help(role: str, exc: BaseException) -> None:
     )
 
 
+def joint_for_servo_id(cfg: ProjectConfig, role: str, servo_id: int) -> str | None:
+    motor_map = cfg.motor_map(role)
+    for joint in JOINT_NAMES:
+        if motor_map.ids.get(joint) == servo_id:
+            return joint
+    return None
+
+
+def _print_connect_failure_help(
+    role: str,
+    exc: BaseException,
+    *,
+    cfg: ProjectConfig | None = None,
+    context: str = "connect",
+) -> None:
+    if not isinstance(exc, ConnectionError):
+        return
+    import re
+
+    joint_hint = ""
+    match = re.search(r"id_=([0-9]+)", str(exc))
+    if match and cfg is not None:
+        joint = joint_for_servo_id(cfg, role, int(match.group(1)))
+        if joint:
+            joint_hint = f"\n  Servo id {match.group(1)} is `{joint}` — reseat its 3-pin cable at the joint and controller."
+    print(
+        f"\nLost contact with the {role} servo bus during {context}.\n"
+        "This is usually a loose daisy-chain cable or insufficient 12V power."
+        f"{joint_hint}"
+        f"\n\n  sarm-hand test-motors --role {role} --retries 5"
+        "\n  Then retry.",
+        file=sys.stderr,
+    )
+
+
 @contextmanager
 def _calibration_sync_read_retries(min_retries: int = 5):
     """Raise default sync_read retries during LeRobot calibration (avoids single-packet drops)."""
@@ -506,6 +541,17 @@ def ensure_bus_calibration(
 
     if not device.is_calibrated:
         device.bus.write_calibration(device.calibration)
+
+
+def sync_follower_goals_to_present(robot: Any) -> None:
+    """Set Goal_Position = Present_Position after connect/configure.
+
+    Servos retain Goal_Position across power cycles. When ``configure()`` re-enables
+    torque, the arm snaps toward that stale goal (often an old ``ready`` pose) before
+    the first policy or teleop command.
+    """
+    present = robot.bus.sync_read("Present_Position")
+    robot.bus.sync_write("Goal_Position", present)
 
 
 def _make_calibrate_device(role: str, port: str, resolved_id: str, cfg: ProjectConfig) -> Any:

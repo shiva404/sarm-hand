@@ -20,6 +20,7 @@ from .calibration_bridge import (
 from .config import JOINT_NAMES, ProjectConfig
 from .robot import (
     _motor_write_retries,
+    _print_connect_failure_help,
     build_robot,
     disable_arm_torque,
     ensure_port,
@@ -410,7 +411,12 @@ def replay_task_motion(
     print(f"\nStarting in {pause_s:.0f}s — reset the scene, then stand clear. Ctrl+C to stop.\n")
     time.sleep(pause_s)
 
-    robot = build_robot(port, cfg, use_cameras=False)
+    try:
+        robot = build_robot(port, cfg, use_cameras=False)
+    except ConnectionError as exc:
+        _print_connect_failure_help("follower", exc, cfg=cfg, context="task replay")
+        raise SystemExit(1) from exc
+
     robot.config.max_relative_target = None
 
     if not robot.is_calibrated:

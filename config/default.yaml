@@ -24,59 +24,77 @@ teleop:
     port: 8020
     simulation: false
 
+camera:
+  # Stop on connect/read failure (no black-frame fallback). Set false only for degraded/debug runs.
+  fail_on_error: true
+
 cameras:
-  # Used by record-leader / record-policy. Teleop: add --with-cameras.
-  # USB: auto_resolution + width/height → capture natively, downscale to 640x480.
-  # UDP: ESP32-CAM chunked JPEG (esp32cam firmware) — decoded on Mac, not HTTP.
-  # Run `sarm-hand list-cameras` for USB indices; `camera-preview --name top` for stream.
+  # ACT setup: fixed front + wrist (2 USB cameras). Run camera-probe --together first.
+  # USB indices: uv run sarm-hand list-cameras
   front:
     type: opencv
     index_or_path: 0
-    auto_resolution: true
+    capture_width: 640
+    capture_height: 480
     width: 640
     height: 480
-    fps: 5
+    auto_resolution: false
+    fps: 10
     warmup_s: 3
-  top:
-    type: udp
-    host: 192.168.0.58
-    port: 82
-    width: 640
-    height: 480
-    fps: 5
-    warmup_s: 3
-    connect_grace_s: 10
-    fps_window: 5
-    rotate_180: true
-    flip_horizontal: true
-  arm:
+  wrist:
     type: opencv
     index_or_path: 1
-    auto_resolution: true
+    capture_width: 640
+    capture_height: 480
     width: 640
     height: 480
-    fps: 5
+    auto_resolution: false
+    fps: 10
     warmup_s: 3
 
-policy:
-  path: lerobot/smolvla_base
-  device: null              # cuda, mps, or cpu (auto-detect if null)
-  episode_time_s: 60
-  control_fps: 10           # policy/record loop rate (5–10 recommended with HTTP cam)
-  # camera_map omitted — uses cameras: keys (front, top, arm) automatically
-  empty_cameras: 0
-  train_dataset: null       # defaults to latest record-leader session (see data/datasets/.latest_session)
-  train_steps: 20000
-  train_batch_size: 64
-  output_dir: outputs/train/sarm101_smolvla
+policies:
+  # Shared: which dataset train-act / train-smolvla use when --dataset-repo-id is omitted
+  train_dataset: null
+
+  act:
+    output_dir: outputs/train/sarm101_act
+    train_epochs: 25             # training passes over dataset (not demo count)
+    train_steps: null            # null = auto; set integer to override
+    train_batch_size: 8
+    save_freq: 600            # checkpoint every N training steps
+    train_num_workers: null     # auto: 0 on mps/cpu, 4 on cuda
+    control_fps: 10             # match dataset.fps (ACT inference loop)
+    episode_time_s: 25          # match dataset.episode_time_s (inference episode length)
+    device: null
+    max_relative_target: 10.0     # per-step joint cap (same as robot.max_relative_target); null = off
+    startup_ramp_steps: 10      # ~1s hold at 10 fps before first inference
+    temporal_ensemble_coeff: null  # set 0.01 for trained policies; over-damps early checkpoints
+    inference_n_action_steps: 50   # replan every N steps when temporal_ensemble_coeff is null
+    inference_blend_steps: 0       # ramp policy weight after hold (0 = off)
+    replan_blend_steps: 0          # soften chunk boundaries (0 = off)
+    action_smoothing: 1.0          # per-tick EMA (1.0 = off)
+    learning_rate: 0.0001        # 1e-4; do not use 0.01 (NaN). LeRobot default is 1e-5.
+
+  smolvla:
+    path: lerobot/smolvla_base
+    output_dir: outputs/train/sarm101_smolvla
+    train_steps: 20000
+    train_batch_size: 8
+    train_num_workers: null
+    control_fps: 10
+    episode_time_s: 60
+    device: null
+    camera_map: {}
+    empty_cameras: 0
+    stats_buffer: so100.buffer
 
 dataset:
   repo_id: local/sarm101-dataset
-  root: data/datasets          # local only; record-leader → same paths as record-sim
-  fps: 5
+  root: data/datasets
+  fps: 10                   # ACT record + train (30 only if keeping old 30 fps datasets)
   single_task: "Pick and place the object"
-  num_episodes: 50
-  episode_time_s: 60
+  num_episodes: 20              # your recorded demos (sarm101-dataset has 20)
+  episode_time_s: 25
   reset_time_s: 10
   push_to_hub: false           # never upload unless --push-to-hub on record-leader or data-push
   video: true                  # save camera MP4s under videos/ (same as record-sim)
@@ -214,8 +232,9 @@ servo:
   mujoco_forcerange_nm: 3.35
 
 # Test poses for `sarm-hand test-poses` (normalized: body -100..100, gripper 0..100).
-# Tune these for your arm after calibration.
+# Mean frame-0 observation.state from training demos (sarm101-dataset-20260627-101519-394717).
 poses:
+  rest_from_genesis: false
   sequence: [home, ready, park, home]
   home:
     shoulder_pan: 0
@@ -225,12 +244,12 @@ poses:
     wrist_roll: 0
     gripper: 50
   ready:
-    shoulder_pan: 0
-    shoulder_lift: -40
-    elbow_flex: 40
-    wrist_flex: -40
-    wrist_roll: 0
-    gripper: 50
+    shoulder_pan: 0.2
+    shoulder_lift: -98.1
+    elbow_flex: 99.1
+    wrist_flex: 47.9
+    wrist_roll: -1.9
+    gripper: 37.1
   park:
     shoulder_pan: 0
     shoulder_lift: 65

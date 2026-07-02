@@ -106,7 +106,8 @@ def _print_recording_guide(
     print("  Or wait for the episode timer — saves automatically.\n")
     print(f"After each episode: {reset_time_s:.0f}s reset window (not saved).")
     print("When done, inspect: uv run sarm-hand data-info --latest")
-    print("Train SmolVLA:      uv run sarm-hand train-smolvla  # uses this session\n")
+    print("Train ACT:          uv run sarm-hand train-act  # front + wrist, uses this session")
+    print("Train SmolVLA:      uv run sarm-hand train-smolvla\n")
     print("Move the leader arm to demonstrate each episode.\n")
 
 
@@ -148,7 +149,7 @@ def _verify_dataset_saved(dataset_dir: Path, session_repo_id: str) -> None:
     print(f"  Path:    {dataset_dir}")
     print(f"  Parquet: {parquet_n} file(s) under data/")
     print(f"  Video:   {mp4_n} file(s) under videos/")
-    print(f"  Train:   uv run sarm-hand train-smolvla --dataset-repo-id {session_repo_id}")
+    print(f"  Train:   uv run sarm-hand train-act --dataset-repo-id {session_repo_id}")
     print(f"  Inspect: uv run sarm-hand data-info --repo-id {session_repo_id}")
     print(f"  Viz:     uv run sarm-hand viz-dataset --repo-id {session_repo_id} --episode 0")
 
@@ -221,7 +222,7 @@ def _run_hardware_record_session(
 
     control_fps = max(cfg.teleop.control_fps, cfg.dataset.fps)
 
-    install_all_camera_patches()
+    install_all_camera_patches(cfg=cfg)
     install_record_feedback_patch()
     prepare_opencv_platform()
 
@@ -285,6 +286,9 @@ def _run_hardware_record_session(
                 robot.bus.connect()
                 ensure_bus_calibration(robot, "follower", cfg=cfg)
                 robot.configure()
+                from .robot import sync_follower_goals_to_present
+
+                sync_follower_goals_to_present(robot)
             teleop.connect(calibrate=False)
             ensure_bus_calibration(teleop, "leader", cfg=cfg)
 
@@ -457,7 +461,7 @@ def _lerobot_dataset_flags(cfg: ProjectConfig) -> list[str]:
 
 def _run_lerobot_record(cmd: list[str], *, dataset_dir: Path, session_repo_id: str) -> None:
     """Run lerobot-record in-process (policy eval recording)."""
-    install_all_camera_patches()
+    install_all_camera_patches(cfg=ProjectConfig.load())
     install_record_feedback_patch()
     sys.argv = list(cmd)
     from lerobot.scripts.lerobot_record import main

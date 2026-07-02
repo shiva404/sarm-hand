@@ -4407,6 +4407,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "lerobot", extra = ["feetech"] },
+    { name = "opencv-python-headless" },
     { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -4467,6 +4468,7 @@ requires-dist = [
     { name = "lerobot-genesis", marker = "extra == 'all'", specifier = ">=0.3" },
     { name = "lerobot-genesis", marker = "extra == 'genesis'", specifier = ">=0.3" },
     { name = "lerobot-genesis", marker = "extra == 'sim-policy'", specifier = ">=0.3" },
+    { name = "opencv-python-headless", specifier = ">=4.8" },
     { name = "phosphobot", marker = "extra == 'all'", specifier = ">=0.3.0" },
     { name = "phosphobot", marker = "extra == 'quest'", specifier = ">=0.3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

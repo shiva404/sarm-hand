@@ -29,9 +29,10 @@ def teleop_leader(
     with_cameras: bool = False,
 ) -> None:
     """Teleoperate S-ARM101 follower with a matching leader arm via USB."""
+    cfg = ProjectConfig.load()
     from .cameras import install_all_camera_patches
 
-    install_all_camera_patches()
+    install_all_camera_patches(cfg=cfg)
     import rerun as rr
     from lerobot.processor import make_default_processors
     from lerobot.robots.so_follower import SO101Follower
@@ -40,7 +41,6 @@ def teleop_leader(
     from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
     from lerobot.utils.utils import init_logging
 
-    cfg = ProjectConfig.load()
     follower_port = ensure_port(follower_port or cfg.robot.port, "Follower")
     leader_port = ensure_port(leader_port or cfg.teleop.leader.port, "Leader")
     leader_cal, follower_cal = require_teleop_calibrations(cfg)
